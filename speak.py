@@ -35,6 +35,8 @@ MODELS_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 24000
 MAX_AUDIO_LENGTH = 300  # 5 minutes max
 MAX_TEXT_LENGTH = 10000  # 10k characters max
+CFG_SCALE = 1.3  # From working implementation
+DDPM_STEPS = 10  # From working implementation
 
 app = FastAPI(
     title="VibeVoice Inference Server",
@@ -156,222 +158,208 @@ def load_model():
         if not gpu_available:
             logger.warning("No GPU available - model performance may be slow")
 
-        # IMPORTANT: Ensure your download_model function actually downloads the model weights.
-        # The original code had an ignore_patterns that skipped .bin/.safetensors files.
+        # Download model if needed
         model_path = download_model()
-        
+
         # Load processor
         logger.info("Loading VibeVoice processor...")
         processor = VibeVoiceProcessor.from_pretrained(str(model_path))
         
-        # --- Corrected Model Loading Logic ---
-        logger.info("Loading VibeVoice model for inference...")
-        
-        # Set up device-specific loading parameters
+        # Decide dtype & attention implementation (from working implementation)
         if str(device) == "cuda":
             load_dtype = torch.bfloat16
-            attn_impl = "flash_attention_2"
-        else: # CPU or MPS
+            attn_impl_primary = "flash_attention_2"
+        else:  # CPU or MPS (fallback to CPU in your setup)
             load_dtype = torch.float32
-            attn_impl = "sdpa"
+            attn_impl_primary = "sdpa"
 
-        logger.info(f"Using device: {device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl}")
+        logger.info(f"Using device: {device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
         
+        # Load model with device-specific logic (from working implementation)
         try:
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
                 torch_dtype=load_dtype,
-                attn_implementation=attn_impl,
+                attn_implementation=attn_impl_primary,
+                device_map="auto" if str(device) == "cuda" else None,
             )
+            if str(device) != "cuda":
+                model.to(device)
         except Exception as e:
-            logger.warning(f"Failed to load with '{attn_impl}': {e}. Falling back to 'sdpa'.")
+            logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'sdpa'.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
                 torch_dtype=load_dtype,
-                attn_implementation='sdpa',
+                attn_implementation="sdpa",
+                device_map="auto" if str(device) == "cuda" else None,
             )
-
-        model = model.to(device)
-        model.eval()
-        model.set_ddpm_inference_steps(num_steps=10) # Set inference steps as in the example
-
-        load_time = time.time() - start_time
-        model_stats = {
-            "load_time_seconds": load_time,
-            "model_path": str(model_path),
-            "device": str(device),
-            "parameters": f"{(sum(p.numel() for p in model.parameters()) / 1e9):.2f}B",
-        }
+            if str(device) != "cuda":
+                model.to(device)
         
+        # Post-load config from working implementation
+        model.eval()
+        model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
+        
+        load_time = time.time() - start_time
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
         
+        # Collect model stats
+        model_stats = {
+            "load_time_seconds": load_time,
+            "device": str(device),
+            "torch_dtype": str(load_dtype),
+            "attn_implementation": attn_impl_primary,
+            "memory_usage_mb": torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else 0
+        }
+        
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+        logger.error(f"Failed to load model: {str(e)}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
-    
-def preprocess_audio(audio_file: bytes, filename: str) -> np.ndarray:
-    """
-    Preprocess uploaded audio file - convert format, resample, denoise.
-    
-    Args:
-        audio_file: Raw audio file bytes
-        filename: Original filename for format detection
-        
-    Returns:
-        numpy.ndarray: Preprocessed audio array
-    """
+        raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
+
+def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
+    """Preprocess uploaded audio file."""
     try:
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(suffix=Path(filename).suffix, delete=False) as tmp_file:
-            tmp_file.write(audio_file)
-            tmp_path = tmp_file.name
+        # Create temp file
+        suffix = Path(filename).suffix
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
         
-        # Load audio using librosa (handles multiple formats)
-        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
-        
-        # Clean up temp file
-        os.unlink(tmp_path)
-        
-        # Resample to target sample rate if needed
-        if sr != SAMPLE_RATE:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-        
-        # Apply noise reduction
-        audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE, prop_decrease=0.8)
-        
-        # Normalize audio
-        audio = audio / np.max(np.abs(audio))
-        
-        # Check duration
-        duration = len(audio) / SAMPLE_RATE
-        if duration > MAX_AUDIO_LENGTH:
-            logger.warning(f"Audio duration {duration:.1f}s exceeds maximum {MAX_AUDIO_LENGTH}s")
-            # Truncate to max length
-            audio = audio[:int(MAX_AUDIO_LENGTH * SAMPLE_RATE)]
-        
-        logger.info(f"Preprocessed audio: {len(audio)} samples, {len(audio)/SAMPLE_RATE:.2f}s duration")
-        return audio
-        
+        try:
+            # Load audio
+            audio, sr = librosa.load(temp_path, sr=None)
+            
+            # Resample if needed
+            if sr != SAMPLE_RATE:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+            
+            # Normalize
+            audio = librosa.util.normalize(audio)
+            
+            # Noise reduction
+            audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
+            
+            # Trim silence
+            audio, _ = librosa.effects.trim(audio, top_db=20)
+            
+            # Check length
+            if len(audio) / SAMPLE_RATE > MAX_AUDIO_LENGTH:
+                raise ValueError(f"Audio too long: {len(audio)/SAMPLE_RATE:.1f}s > {MAX_AUDIO_LENGTH}s")
+            
+            return audio
+            
+        finally:
+            os.unlink(temp_path)
+            
     except Exception as e:
         logger.error(f"Failed to preprocess audio: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to process audio file: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
 
-def generate_audio(text: str, voice_samples: Optional[List[np.ndarray]] = None) -> tuple[np.ndarray, AudioStats]:
-    """
-    Generate audio using VibeVoice model.
-    
-    Args:
-        text: Input text
-        voice_samples: Optional voice samples for cloning
-        
-    Returns:
-        tuple: (generated_audio, stats)
-    """
+def audio_to_bytes(audio: np.ndarray) -> bytes:
+    """Convert numpy audio array to WAV bytes."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        sf.write(temp_file.name, audio, SAMPLE_RATE)
+        temp_file.seek(0)
+        return temp_file.read()
+
+def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarray, AudioStats]:
+    """Generate audio using VibeVoice model."""
     if model is None or processor is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="Model not loaded")
     
     start_time = time.time()
-    gpu_memory_start = torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else None
     
     try:
+        # Validate text length
         if len(text) > MAX_TEXT_LENGTH:
-            raise HTTPException(status_code=400, detail=f"Text too long. Maximum {MAX_TEXT_LENGTH} characters.")
+            raise ValueError(f"Text too long: {len(text)} > {MAX_TEXT_LENGTH}")
         
-        model_start = time.time()
-        
+        # Format text as script (enhanced from working implementation's parsing)
         num_speakers = len(voice_samples)
         if num_speakers == 1:
             formatted_text = f"Speaker 1: {text.strip()}"
         else:
-            # For multi-speaker: Ensure it has labels; append if missing (basic enhancement)
+            # For multi-speaker: Ensure labels; simple fallback if missing
             if "Speaker" not in text:
-                # Simple fallback: Split text by lines and assign sequential speakers
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 if lines:
                     formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
                     formatted_text = "\n".join(formatted_lines)
                 else:
-                    formatted_text = text  # Fallback to original
+                    formatted_text = text
             else:
                 formatted_text = text
         
-        # --- Corrected Input Formatting ---
-        # The processor expects batch inputs, so we wrap our single input in lists.
+        # Clean apostrophes (from working implementation)
+        formatted_text = formatted_text.replace("’", "'")
+        
+        # Prepare inputs (batched as in working implementation)
         inputs = processor(
-            text=formatted_text,
-            voice_samples=[voice_samples],
+            text=[formatted_text],  # Wrap in list for batch
+            audio=voice_samples,  # List of arrays (processor handles)
+            padding=True,
             return_tensors="pt",
-            padding=True
+            return_attention_mask=True,
         )
         
-        # Move inputs to the correct device
-        for key, value in inputs.items():
-            if torch.is_tensor(value):
-                inputs[key] = value.to(device)
+        # Move tensors to device (from working implementation)
+        target_device = device
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(target_device)
         
-        # --- Corrected Generation Call and Output Handling ---
-        with torch.no_grad():
-            outputs = model.generate(
+        # Patch missing config attr (your previous fix)
+        if not hasattr(model.config, 'num_hidden_layers'):
+            model.config.num_hidden_layers = getattr(model.config, 'language_model_num_hidden_layers', 
+                                                    getattr(model.config, 'encoder_num_hidden_layers', 28))
+        
+        # Generate (exact kwargs from working implementation)
+        inference_start = time.time()
+        with torch.inference_mode():
+            generated_audio = model.generate(
                 **inputs,
-                max_new_tokens=None,
-                cfg_scale=1.3,  # A sensible default from the example
+                max_new_tokens=None,  # Key to avoid cache arg errors
+                cfg_scale=CFG_SCALE,
                 tokenizer=processor.tokenizer,
                 generation_config={'do_sample': False},
                 verbose=True,
             )
-            
-            # The actual audio is in the `speech_outputs` attribute of the output object
-            generated_audio = outputs.speech_outputs[0].cpu().numpy()
-            
-        model_inference_time = time.time() - model_start
-        total_time = time.time() - start_time
         
-        gpu_memory_used = None
-        if torch.cuda.is_available() and gpu_memory_start is not None:
-            gpu_memory_end = torch.cuda.memory_allocated(0) / 1024**2
-            gpu_memory_used = gpu_memory_end - gpu_memory_start
+        inference_time = time.time() - inference_start
+        
+        # Process output (from working implementation)
+        generated_audio = generated_audio.speech_outputs[0].cpu().numpy()
+        
+        # Get stats
+        gpu_mem_used = torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else None
         
         stats = AudioStats(
             duration_seconds=len(generated_audio) / SAMPLE_RATE,
             sample_rate=SAMPLE_RATE,
             channels=1,
-            processing_time_seconds=total_time,
-            model_inference_time_seconds=model_inference_time,
-            gpu_memory_used_mb=gpu_memory_used
+            processing_time_seconds=time.time() - start_time,
+            model_inference_time_seconds=inference_time,
+            gpu_memory_used_mb=gpu_mem_used
         )
         
-        logger.info(f"Generated audio: {stats.duration_seconds:.2f}s in {total_time:.2f}s")
         return generated_audio, stats
         
     except Exception as e:
-        logger.error(f"Failed to generate audio: {e}")
+        logger.error(f"Audio generation failed: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
-def audio_to_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
-    """Convert numpy audio array to WAV bytes."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-        sf.write(tmp_file.name, audio, sample_rate)
-        with open(tmp_file.name, "rb") as f:
-            audio_bytes = f.read()
-        os.unlink(tmp_file.name)
-    return audio_bytes
-
 @app.on_event("startup")
-async def startup_event():
-    """Load model on startup."""
-    logger.info("Starting VibeVoice server...")
+def startup_event():
     load_model()
 
-@app.get("/", response_model=dict)
+@app.get("/")
 async def root():
-    """Root endpoint with server info."""
-    system_info = get_system_info()
     return {
-        "message": "VibeVoice Inference Server",
+        "message": "VibeVoice Inference Server is running",
         "version": "1.0.0",
-        "system_info": system_info.dict(),
+        "model": MODEL_NAME,
         "model_stats": model_stats,
         "endpoints": {
             "/single-speaker": "Single speaker TTS with voice cloning",
@@ -455,7 +443,7 @@ async def multi_speaker_tts(
     voice_files: List[UploadFile] = File(...)
 ):
     """
-    Generate speech using multi-speaker with voice cloning.
+    Generate speech using multiple speakers with voice cloning.
     
     Args:
         text: Text with speaker labels (e.g., "Speaker 1: Hello\nSpeaker 2: Hi there")
