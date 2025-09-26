@@ -6,3 +6,13 @@
 .DS_Store
 .ipynb_checkpoints
 .env   
+/vibevoice/__pycache__
+/vibevoice/modular/__pycache__
+/vibevoice/modular/modeling_vibevoice_inference.pyc
+/vibevoice/modular/modeling_vibevoice.pyc
+/vibevoice/modular/tokenization_vibevoice.pyc
+/vibevoice/modular/optimization_vibevoice.pyc
+/vibevoice/modular/configuration_vibevoice.pyc
+/vibevoice/modular/modeling_vibevoice_diffusion.pyc
+/vibevoice/modular/modeling_vibevoice_diffusion_inference.pyc   
+/models

@@ -179,7 +179,7 @@ def load_model():
         try:
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
-                torch_dtype=load_dtype,
+                dtype=load_dtype,
                 attn_implementation=attn_impl_primary,
                 device_map="auto" if str(device) == "cuda" else None,
             )
@@ -189,7 +189,7 @@ def load_model():
             logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'sdpa'.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
-                torch_dtype=load_dtype,
+                dtype=load_dtype,
                 attn_implementation="sdpa",
                 device_map="auto" if str(device) == "cuda" else None,
             )
@@ -207,7 +207,7 @@ def load_model():
         model_stats = {
             "load_time_seconds": load_time,
             "device": str(device),
-            "torch_dtype": str(load_dtype),
+            "dtype": str(load_dtype),
             "attn_implementation": attn_impl_primary,
             "memory_usage_mb": torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else 0
         }
@@ -217,14 +217,16 @@ def load_model():
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
     """Preprocess uploaded audio file."""
     try:
-        # Create temp file
-        suffix = Path(filename).suffix
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
+        # Save to project root as a temp file
+        suffix = Path(filename).suffix or ".wav"
+        temp_path = PROJECT_ROOT / f"temp_{os.getpid()}{suffix}"  # unique name
+        
+        with open(temp_path, "wb") as f:
+            f.write(audio_bytes)
         
         try:
             # Load audio
@@ -240,22 +242,24 @@ def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
             # Noise reduction
             audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
             
-            # Trim silence
+            # Trim silence (optional)
             audio, _ = librosa.effects.trim(audio, top_db=20)
             
             # Check length
             if len(audio) / SAMPLE_RATE > MAX_AUDIO_LENGTH:
-                raise ValueError(f"Audio too long: {len(audio)/SAMPLE_RATE:.1f}s > {MAX_AUDIO_LENGTH}s")
+                raise ValueError(
+                    f"Audio too long: {len(audio)/SAMPLE_RATE:.1f}s > {MAX_AUDIO_LENGTH}s"
+                )
             
             return audio
-            
+        
         finally:
-            os.unlink(temp_path)
-            
+            if temp_path.exists():
+                os.remove(temp_path)
+    
     except Exception as e:
         logger.error(f"Failed to preprocess audio: {e}")
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
-
 def audio_to_bytes(audio: np.ndarray) -> bytes:
     """Convert numpy audio array to WAV bytes."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
@@ -297,7 +301,7 @@ def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarr
         # Prepare inputs (batched as in working implementation)
         inputs = processor(
             text=[formatted_text],  # Wrap in list for batch
-            audio=voice_samples,  # List of arrays (processor handles)
+            voice_samples=voice_samples,  # List of arrays (processor handles)
             padding=True,
             return_tensors="pt",
             return_attention_mask=True,
@@ -396,6 +400,7 @@ async def single_speaker_tts(
         text: Text to convert to speech
         voice_file: Audio file for voice cloning (WAV/MP3)
     """
+    logger.info("Received single-speaker TTS request", text, voice_file.headers, voice_file.filename, voice_file.content_type, voice_file.size)
     try:
         # Validate inputs
         if not text.strip():
