@@ -20,8 +20,8 @@ from huggingface_hub import snapshot_download
 import psutil
 
 # Import your VibeVoice components
-from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
-from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+from vibevoiceold.processor.vibevoice_processor import VibeVoiceProcessor
+from vibevoiceold.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 import traceback
 
 # Configure logging
