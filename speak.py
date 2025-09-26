@@ -260,10 +260,11 @@ def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
     except Exception as e:
         logger.error(f"Failed to preprocess audio: {e}")
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
+    
 def audio_to_bytes(audio: np.ndarray) -> bytes:
     """Convert numpy audio array to WAV bytes."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-        sf.write(temp_file.name, audio, SAMPLE_RATE)
+    with tempfile.NamedTemporaryFile(suffix=".wav") as temp_file:
+        sf.write(temp_file, audio, SAMPLE_RATE, format='WAV')
         temp_file.seek(0)
         return temp_file.read()
 
@@ -332,7 +333,6 @@ def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarr
         
         inference_time = time.time() - inference_start
         
-        # Process output (from working implementation)
         generated_audio = generated_audio.speech_outputs[0].cpu().to(torch.float32).numpy()
         
         # Get stats
