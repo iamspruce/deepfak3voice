@@ -381,7 +381,7 @@ async def get_system_info_endpoint():
     return get_system_info()
 
 @app.post("/single-speaker")
-def single_speaker_tts(
+async def single_speaker_tts(
     text: str = Form(...),
     voice_file: UploadFile = File(...)
 ):
@@ -401,7 +401,7 @@ def single_speaker_tts(
             raise HTTPException(status_code=400, detail="Unsupported audio format")
         
         # Read and preprocess audio
-        audio_bytes = voice_file.read()
+        audio_bytes = await voice_file.read()
         voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
         
         # Generate audio
@@ -434,7 +434,7 @@ def single_speaker_tts(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/multi-speaker")
-def multi_speaker_tts(
+async def multi_speaker_tts(
     text: str = Form(...),
     voice_files: List[UploadFile] = File(...)
 ):
@@ -469,7 +469,7 @@ def multi_speaker_tts(
                     detail=f"Unsupported audio format in file {i+1}: {voice_file.filename}"
                 )
             
-            audio_bytes = voice_file.read()
+            audio_bytes = await voice_file.read()
             voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
             voice_samples.append(voice_sample)
         
