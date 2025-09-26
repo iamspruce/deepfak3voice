@@ -179,7 +179,7 @@ def load_model():
         try:
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
-                dtype=load_dtype,
+                torch_dtype=load_dtype,
                 attn_implementation=attn_impl_primary,
                 device_map="auto" if str(device) == "cuda" else None,
             )
@@ -189,7 +189,7 @@ def load_model():
             logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'sdpa'.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
-                dtype=load_dtype,
+                torch_dtype=load_dtype,
                 attn_implementation="sdpa",
                 device_map="auto" if str(device) == "cuda" else None,
             )
@@ -207,7 +207,7 @@ def load_model():
         model_stats = {
             "load_time_seconds": load_time,
             "device": str(device),
-            "dtype": str(load_dtype),
+            "torch_dtype": str(load_dtype),
             "attn_implementation": attn_impl_primary,
             "memory_usage_mb": torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else 0
         }
