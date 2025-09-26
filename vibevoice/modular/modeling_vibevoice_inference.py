@@ -300,7 +300,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         )
 
         max_cache_length = generation_config.max_length - 1
-        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
+        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, device)
         model_kwargs['cache_position'] = torch.arange(input_ids_length, device=device, dtype=torch.long)
         for k, v in model_kwargs.items():
             if isinstance(v, torch.Tensor):
@@ -551,13 +551,17 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     negative_model_kwargs['attention_mask'][sample_idx, :] = 0
                     negative_model_kwargs['attention_mask'][sample_idx, -1] = 1
                 # update past key values
-                for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, 
-                                                                        negative_model_kwargs['past_key_values'].value_cache)):
-                    # Process each non-diffusion sample
-                    for sample_idx in diffusion_start_indices.tolist():
-                        # Shift cache for this sample
-                        k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
-                        v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+                try:
+                    for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, negative_model_kwargs['past_key_values'].value_cache)):
+                        # Process each non-diffusion sample
+                        for sample_idx in diffusion_start_indices.tolist():
+                            # Shift cache for this sample
+                            k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
+                            v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+                except Exception as e:
+                    print(f"Cache shift error: {e}")
+                    print(negative_model_kwargs['past_key_values'])  # Debug
+                    negative_model_kwargs['past_key_values'] = None  # Bypass cache
                 # update negative_input_ids
                 for sample_idx in diffusion_start_indices.tolist():
                     negative_input_ids[sample_idx, -1] = generation_config.speech_start_id
