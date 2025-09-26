@@ -333,7 +333,7 @@ def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarr
         inference_time = time.time() - inference_start
         
         # Process output (from working implementation)
-        generated_audio = generated_audio.speech_outputs[0].cpu().numpy()
+        generated_audio = generated_audio.speech_outputs[0].cpu().to(torch.float32).numpy()
         
         # Get stats
         gpu_mem_used = torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else None
