@@ -1,0 +1,37 @@
+# Core FastAPI and server dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# PyTorch and ML dependencies
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.35.0
+huggingface-hub>=0.17.0
+tokenizers>=0.14.0
+
+# Audio processing
+librosa>=0.10.1
+soundfile>=0.12.1
+noisereduce>=3.0.0
+scipy>=1.11.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# API and networking
+requests>=2.31.0
+aiofiles>=23.2.0
+pydantic>=2.4.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Development and utilities
+python-dotenv>=1.0.0
+pillow>=10.0.0
+
+# Optional: For enhanced audio processing
+# pyaudio>=0.2.11  # Uncomment if you need real-time audio
+# webrtcvad>=2.0.10  # Uncomment for voice activity detection
