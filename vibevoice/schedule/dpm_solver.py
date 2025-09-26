@@ -20,10 +20,10 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from vibevoice.diffusers.configuration_utils import ConfigMixin, register_to_config
-from vibevoice.diffusers.utils import deprecate
-from vibevoice.diffusers.utils.torch_utils import randn_tensor
-from vibevoice.diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
+from .diffusers.configuration_utils import ConfigMixin, register_to_config
+from .diffusers.utils import deprecate
+from .diffusers.utils.torch_utils import randn_tensor
+from .diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 
 def betas_for_alpha_bar(
     num_diffusion_timesteps,
