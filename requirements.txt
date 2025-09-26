@@ -6,7 +6,8 @@ python-multipart>=0.0.6
 # PyTorch and ML dependencies
 torch>=2.1.0
 torchaudio>=2.1.0
-transformers>=4.35.0
+transformers==4.51.3
+diffusers
 huggingface-hub>=0.17.0
 tokenizers>=0.14.0
 
