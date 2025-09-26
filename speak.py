@@ -280,10 +280,26 @@ def generate_audio(text: str, voice_samples: Optional[List[np.ndarray]] = None) 
         
         model_start = time.time()
         
+        num_speakers = len(voice_samples)
+        if num_speakers == 1:
+            formatted_text = f"Speaker 1: {text.strip()}"
+        else:
+            # For multi-speaker: Ensure it has labels; append if missing (basic enhancement)
+            if "Speaker" not in text:
+                # Simple fallback: Split text by lines and assign sequential speakers
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                if lines:
+                    formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
+                    formatted_text = "\n".join(formatted_lines)
+                else:
+                    formatted_text = text  # Fallback to original
+            else:
+                formatted_text = text
+        
         # --- Corrected Input Formatting ---
         # The processor expects batch inputs, so we wrap our single input in lists.
         inputs = processor(
-            text=[text],
+            text=formatted_text,
             voice_samples=[voice_samples],
             return_tensors="pt",
             padding=True
