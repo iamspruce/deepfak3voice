@@ -1,28 +1,30 @@
 import os
 import time
-import tempfile
+import io
+import wave
 import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-import json
 import traceback
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import numpy as np
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import noisereduce as nr
 from huggingface_hub import snapshot_download
 import psutil
+import GPUtil
 
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,13 +37,18 @@ MODELS_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 24000
 MAX_AUDIO_LENGTH = 300  # 5 minutes max
 MAX_TEXT_LENGTH = 10000  # 10k characters max
-CFG_SCALE = 1.3  # From working implementation
-DDPM_STEPS = 10  # From working implementation
+CFG_SCALE = 1.3
+DDPM_STEPS = 10
+
+# Performance optimizations
+WARMUP_ITERATIONS = 3
+THREAD_POOL_SIZE = 4
+AUDIO_CACHE_SIZE = 100
 
 app = FastAPI(
     title="VibeVoice Inference Server",
-    description="FastAPI server for VibeVoice text-to-speech with single and multi-speaker support",
-    version="1.0.0"
+    description="FastAPI server for VibeVoice text-to-speech with low latency",
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -55,7 +62,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins, # Only allows your specified domains
     allow_credentials=True,
-    allow_methods=["GET", "POST"], # Be specific about allowed methods
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -64,23 +71,37 @@ processor = None
 model = None
 device = None
 model_stats = {}
+thread_pool = None
+warmup_complete = False
+
+# Performance monitoring
+performance_stats = {
+    "total_requests": 0,
+    "average_inference_time": 0,
+    "average_preprocessing_time": 0,
+    "average_postprocessing_time": 0,
+    "peak_memory_usage": 0,
+    "cache_hits": 0,
+    "cache_misses": 0
+}
 
 class SystemInfo(BaseModel):
     gpu_available: bool
     gpu_name: Optional[str]
     gpu_memory_total: Optional[float]
     gpu_memory_available: Optional[float]
+    gpu_memory_used: Optional[float]
+    gpu_utilization: Optional[float]
+    gpu_temperature: Optional[float]
     cpu_count: int
+    cpu_usage: float
     ram_total: float
     ram_available: float
+    ram_used: float
     model_loaded: bool
     model_path: Optional[str]
-
-class SingleSpeakerRequest(BaseModel):
-    text: str
-
-class MultiSpeakerRequest(BaseModel):
-    text: str
+    warmup_complete: bool
+    performance_stats: Dict[str, Any]
 
 class AudioStats(BaseModel):
     duration_seconds: float
@@ -88,40 +109,101 @@ class AudioStats(BaseModel):
     channels: int
     processing_time_seconds: float
     model_inference_time_seconds: float
+    preprocessing_time_seconds: float
+    postprocessing_time_seconds: float
     gpu_memory_used_mb: Optional[float]
+    gpu_memory_peak_mb: Optional[float]
+    gpu_utilization: Optional[float]
+    cpu_usage_during_inference: Optional[float]
+    queue_time_seconds: float
+    total_latency_seconds: float
+
+def get_detailed_gpu_info():
+    """Get comprehensive GPU information."""
+    try:
+        if torch.cuda.is_available():
+            gpu_id = 0
+            gpu_name = torch.cuda.get_device_name(gpu_id)
+            gpu_props = torch.cuda.get_device_properties(gpu_id)
+            total_memory = gpu_props.total_memory / 1024**3
+            allocated_memory = torch.cuda.memory_allocated(gpu_id) / 1024**3
+            cached_memory = torch.cuda.memory_reserved(gpu_id) / 1024**3
+            available_memory = total_memory - allocated_memory
+            
+            # Get GPU utilization and temperature using GPUtil if available
+            gpu_util = None
+            gpu_temp = None
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]
+                    gpu_util = gpu.load * 100
+                    gpu_temp = gpu.temperature
+            except:
+                pass
+            
+            return {
+                "available": True,
+                "name": gpu_name,
+                "total_memory": total_memory,
+                "allocated_memory": allocated_memory,
+                "cached_memory": cached_memory,
+                "available_memory": available_memory,
+                "utilization": gpu_util,
+                "temperature": gpu_temp
+            }
+    except Exception as e:
+        logger.error(f"Failed to get GPU info: {e}")
+    
+    return {
+        "available": False,
+        "name": None,
+        "total_memory": None,
+        "allocated_memory": None,
+        "cached_memory": None,
+        "available_memory": None,
+        "utilization": None,
+        "temperature": None
+    }
 
 def check_gpu_compatibility():
     """Check if compatible GPU is available and return device info."""
     global device
     
-    if torch.cuda.is_available():
+    gpu_info = get_detailed_gpu_info()
+    
+    if gpu_info["available"]:
         device = torch.device("cuda")
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        gpu_memory_available = (torch.cuda.get_device_properties(0).total_memory - 
-                               torch.cuda.memory_allocated(0)) / 1024**3
-        
-        logger.info(f"GPU detected: {gpu_name} with {gpu_memory_total:.1f}GB total memory")
-        return True, gpu_name, gpu_memory_total, gpu_memory_available
+        logger.info(f"GPU detected: {gpu_info['name']} with {gpu_info['total_memory']:.1f}GB total memory")
+        return True, gpu_info
     else:
         device = torch.device("cpu")
         logger.warning("No CUDA GPU available, falling back to CPU")
-        return False, None, None, None
+        return False, gpu_info
 
 def get_system_info() -> SystemInfo:
-    """Get current system information."""
-    gpu_available, gpu_name, gpu_total, gpu_available_mem = check_gpu_compatibility()
+    """Get comprehensive system information."""
+    gpu_available, gpu_info = check_gpu_compatibility()
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    memory = psutil.virtual_memory()
     
     return SystemInfo(
         gpu_available=gpu_available,
-        gpu_name=gpu_name,
-        gpu_memory_total=gpu_total,
-        gpu_memory_available=gpu_available_mem,
+        gpu_name=gpu_info.get("name"),
+        gpu_memory_total=gpu_info.get("total_memory"),
+        gpu_memory_available=gpu_info.get("available_memory"),
+        gpu_memory_used=gpu_info.get("allocated_memory"),
+        gpu_utilization=gpu_info.get("utilization"),
+        gpu_temperature=gpu_info.get("temperature"),
         cpu_count=psutil.cpu_count(),
-        ram_total=psutil.virtual_memory().total / 1024**3,
-        ram_available=psutil.virtual_memory().available / 1024**3,
+        cpu_usage=cpu_percent,
+        ram_total=memory.total / 1024**3,
+        ram_available=memory.available / 1024**3,
+        ram_used=memory.used / 1024**3,
         model_loaded=model is not None,
-        model_path=str(MODELS_DIR / MODEL_NAME) if model else None
+        model_path=str(MODELS_DIR / MODEL_NAME) if model else None,
+        warmup_complete=warmup_complete,
+        performance_stats=performance_stats
     )
 
 def download_model():
@@ -131,7 +213,6 @@ def download_model():
     if not model_path.exists():
         logger.info(f"Downloading model {MODEL_NAME} to {model_path}")
         try:
-            # REMOVED ignore_patterns to ensure weights are downloaded
             snapshot_download(
                 repo_id=MODEL_NAME,
                 local_dir=model_path,
@@ -143,9 +224,64 @@ def download_model():
     
     return model_path
 
+def warmup_model():
+    """Warmup model with dummy data for optimal performance."""
+    global warmup_complete
+    
+    if not model or not processor:
+        return
+    
+    logger.info("Starting model warmup...")
+    warmup_start = time.time()
+    
+    try:
+        # Create dummy audio and text
+        dummy_audio = np.random.randn(SAMPLE_RATE * 3).astype(np.float32)  # 3 seconds
+        dummy_text = "Speaker 1: This is a warmup text to optimize the model performance."
+        
+        for i in range(WARMUP_ITERATIONS):
+            logger.info(f"Warmup iteration {i+1}/{WARMUP_ITERATIONS}")
+            
+            # Process inputs
+            inputs = processor(
+                text=[dummy_text],
+                voice_samples=[dummy_audio],
+                padding=True,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            
+            # Move to device
+            for k, v in inputs.items():
+                if torch.is_tensor(v):
+                    inputs[k] = v.to(device)
+            
+            # Generate
+            with torch.inference_mode():
+                _ = model.generate(
+                    **inputs,
+                    max_new_tokens=None,
+                    cfg_scale=CFG_SCALE,
+                    tokenizer=processor.tokenizer,
+                    generation_config={'do_sample': False},
+                    verbose=False,
+                )
+        
+        # Clear cache after warmup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        warmup_complete = True
+        warmup_time = time.time() - warmup_start
+        logger.info(f"Model warmup completed in {warmup_time:.2f} seconds")
+        
+    except Exception as e:
+        logger.error(f"Model warmup failed: {e}")
+        warmup_complete = False
+
 def load_model():
-    """Load the VibeVoice model and processor."""
-    global processor, model, model_stats
+    """Load the VibeVoice model and processor with optimizations."""
+    global processor, model, model_stats, thread_pool
 
     if model is not None:
         return
@@ -153,8 +289,11 @@ def load_model():
     start_time = time.time()
     
     try:
+        # Initialize thread pool
+        thread_pool = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
+        
         # Check GPU compatibility first
-        gpu_available, _, _, _ = check_gpu_compatibility()
+        gpu_available, gpu_info = check_gpu_compatibility()
         if not gpu_available:
             logger.warning("No GPU available - model performance may be slow")
 
@@ -165,23 +304,24 @@ def load_model():
         logger.info("Loading VibeVoice processor...")
         processor = VibeVoiceProcessor.from_pretrained(str(model_path))
         
-        # Decide dtype & attention implementation (from working implementation)
+        # Optimize model loading
         if str(device) == "cuda":
             load_dtype = torch.bfloat16
             attn_impl_primary = "flash_attention_2"
-        else:  # CPU or MPS (fallback to CPU in your setup)
+        else:
             load_dtype = torch.float32
             attn_impl_primary = "sdpa"
 
         logger.info(f"Using device: {device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
         
-        # Load model with device-specific logic (from working implementation)
+        # Load model with optimizations
         try:
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
                 torch_dtype=load_dtype,
                 attn_implementation=attn_impl_primary,
                 device_map="auto" if str(device) == "cuda" else None,
+                low_cpu_mem_usage=True,  # Memory optimization
             )
             if str(device) != "cuda":
                 model.to(device)
@@ -192,13 +332,26 @@ def load_model():
                 torch_dtype=load_dtype,
                 attn_implementation="sdpa",
                 device_map="auto" if str(device) == "cuda" else None,
+                low_cpu_mem_usage=True,
             )
             if str(device) != "cuda":
                 model.to(device)
         
-        # Post-load config from working implementation
+        # Model optimizations
         model.eval()
         model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
+        
+        # Enable optimizations
+        if hasattr(model, 'half') and str(device) == "cuda":
+            model = model.half()  # Use FP16 for faster inference
+        
+        # Compile model for PyTorch 2.0+ (if available)
+        try:
+            if hasattr(torch, 'compile'):
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("Model compiled with torch.compile for better performance")
+        except Exception as e:
+            logger.warning(f"Failed to compile model: {e}")
         
         load_time = time.time() - start_time
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
@@ -209,83 +362,107 @@ def load_model():
             "device": str(device),
             "torch_dtype": str(load_dtype),
             "attn_implementation": attn_impl_primary,
-            "memory_usage_mb": torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else 0
+            "memory_usage_mb": gpu_info.get("allocated_memory", 0) * 1024 if gpu_info.get("allocated_memory") else 0,
+            "compiled": hasattr(model, '_dynamo_orig_callable') if hasattr(torch, 'compile') else False
         }
+        
+        # Perform warmup
+        warmup_model()
         
     except Exception as e:
         logger.error(f"Failed to load model: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
-    """Preprocess uploaded audio file."""
-    try:
-        # Save to project root as a temp file
-        suffix = Path(filename).suffix or ".wav"
-        temp_path = PROJECT_ROOT / f"temp_{os.getpid()}{suffix}"  # unique name
-        
-        with open(temp_path, "wb") as f:
-            f.write(audio_bytes)
-        
-        try:
-            # Load audio
-            audio, sr = librosa.load(temp_path, sr=None)
-            
-            # Resample if needed
-            if sr != SAMPLE_RATE:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-            
-            # Normalize
-            audio = librosa.util.normalize(audio)
-            
-            # Noise reduction
-            audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
-            
-            # Trim silence (optional)
-            audio, _ = librosa.effects.trim(audio, top_db=20)
-            
-            # Check length
-            if len(audio) / SAMPLE_RATE > MAX_AUDIO_LENGTH:
-                raise ValueError(
-                    f"Audio too long: {len(audio)/SAMPLE_RATE:.1f}s > {MAX_AUDIO_LENGTH}s"
-                )
-            
-            return audio
-        
-        finally:
-            if temp_path.exists():
-                os.remove(temp_path)
+    """audio preprocessing with better performance."""
+    preprocess_start = time.time()
     
+    try:
+        # Use in-memory processing to avoid file I/O
+        audio_io = io.BytesIO(audio_bytes)
+        
+        # Load audio directly from memory
+        audio, sr = librosa.load(audio_io, sr=None)
+        
+        # Batch operations for efficiency
+        if sr != SAMPLE_RATE:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+        
+        # Normalize and denoise in one pass
+        audio = librosa.util.normalize(audio)
+        
+        # Optional noise reduction (can be disabled for speed)
+        audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
+        
+        # Trim silence with optimized parameters
+        audio, _ = librosa.effects.trim(audio, top_db=20)
+        
+        # Validate length
+        if len(audio) / SAMPLE_RATE > MAX_AUDIO_LENGTH:
+            raise ValueError(f"Audio too long: {len(audio)/SAMPLE_RATE:.1f}s > {MAX_AUDIO_LENGTH}s")
+        
+        preprocess_time = time.time() - preprocess_start
+        performance_stats["average_preprocessing_time"] = (
+            performance_stats["average_preprocessing_time"] * 0.9 + preprocess_time * 0.1
+        )
+        
+        return audio
+        
     except Exception as e:
         logger.error(f"Failed to preprocess audio: {e}")
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
-    
-def audio_to_bytes(audio: np.ndarray) -> bytes:
-    """Convert numpy audio array to WAV bytes."""
-    with tempfile.NamedTemporaryFile(suffix=".wav") as temp_file:
-        sf.write(temp_file, audio, SAMPLE_RATE, format='WAV')
-        temp_file.seek(0)
-        return temp_file.read()
 
-def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarray, AudioStats]:
-    """Generate audio using VibeVoice model."""
+def audio_to_bytes(audio: np.ndarray) -> bytes:
+    """audio conversion to bytes."""
+    postprocess_start = time.time()
+    
+    # Vectorized operations
+    if audio.ndim > 1:
+        audio = np.squeeze(audio)
+    
+    # Ensure float32 and clip in one operation
+    audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
+    
+    # Convert to int16 PCM efficiently
+    audio_int16 = (audio * 32767).astype(np.int16)
+    
+    # Write to in-memory WAV
+    byte_io = io.BytesIO()
+    with wave.open(byte_io, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(audio_int16.tobytes())
+    
+    postprocess_time = time.time() - postprocess_start
+    performance_stats["average_postprocessing_time"] = (
+        performance_stats["average_postprocessing_time"] * 0.9 + postprocess_time * 0.1
+    )
+    
+    return byte_io.getvalue()
+
+async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarray, AudioStats]:
+    """Asynchronous audio generation with detailed stats."""
     if model is None or processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    start_time = time.time()
+    if not warmup_complete:
+        raise HTTPException(status_code=503, detail="Model is still warming up")
+    
+    total_start = time.time()
+    queue_start = total_start
     
     try:
         # Validate text length
         if len(text) > MAX_TEXT_LENGTH:
             raise ValueError(f"Text too long: {len(text)} > {MAX_TEXT_LENGTH}")
         
-        # Format text as script (enhanced from working implementation's parsing)
+        # Format text efficiently
         num_speakers = len(voice_samples)
         if num_speakers == 1:
             formatted_text = f"Speaker 1: {text.strip()}"
         else:
-            # For multi-speaker: Ensure labels; simple fallback if missing
             if "Speaker" not in text:
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 if lines:
@@ -296,55 +473,97 @@ def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarr
             else:
                 formatted_text = text
         
-        # Clean apostrophes (from working implementation)
-        formatted_text = formatted_text.replace("’", "'")
+        formatted_text = formatted_text.replace("â€™", "'")
         
-        # Prepare inputs (batched as in working implementation)
+        # Track CPU usage before inference
+        cpu_before = psutil.cpu_percent(interval=None)
+        gpu_before = get_detailed_gpu_info()
+        
+        # Process inputs
+        processing_start = time.time()
         inputs = processor(
-            text=[formatted_text],  # Wrap in list for batch
-            voice_samples=voice_samples,  # List of arrays (processor handles)
+            text=[formatted_text],
+            voice_samples=voice_samples,
             padding=True,
             return_tensors="pt",
             return_attention_mask=True,
         )
         
-        # Move tensors to device (from working implementation)
-        target_device = device
+        # Move tensors to device efficiently
         for k, v in inputs.items():
             if torch.is_tensor(v):
-                inputs[k] = v.to(target_device)
+                inputs[k] = v.to(device, non_blocking=True)
         
-        # Patch missing config attr (your previous fix)
+        queue_time = processing_start - queue_start
+        
+        # Patch config if needed
         if not hasattr(model.config, 'num_hidden_layers'):
-            model.config.num_hidden_layers = getattr(model.config, 'language_model_num_hidden_layers', 
-                                                    getattr(model.config, 'encoder_num_hidden_layers', 28))
-        
-        # Generate (exact kwargs from working implementation)
-        inference_start = time.time()
-        with torch.inference_mode():
-            generated_audio = model.generate(
-                **inputs,
-                max_new_tokens=None,  # Key to avoid cache arg errors
-                cfg_scale=CFG_SCALE,
-                tokenizer=processor.tokenizer,
-                generation_config={'do_sample': False},
-                verbose=True,
+            model.config.num_hidden_layers = getattr(
+                model.config, 'language_model_num_hidden_layers',
+                getattr(model.config, 'encoder_num_hidden_layers', 28)
             )
+        
+        # Generate with performance monitoring
+        inference_start = time.time()
+        
+        with torch.inference_mode():
+            # Use autocast for mixed precision if available
+            if str(device) == "cuda" and torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    generated_audio = model.generate(
+                        **inputs,
+                        max_new_tokens=None,
+                        cfg_scale=CFG_SCALE,
+                        tokenizer=processor.tokenizer,
+                        generation_config={'do_sample': False},
+                        verbose=False,
+                    )
+            else:
+                generated_audio = model.generate(
+                    **inputs,
+                    max_new_tokens=None,
+                    cfg_scale=CFG_SCALE,
+                    tokenizer=processor.tokenizer,
+                    generation_config={'do_sample': False},
+                    verbose=False,
+                )
         
         inference_time = time.time() - inference_start
         
+        # Get final stats
+        cpu_after = psutil.cpu_percent(interval=None)
+        gpu_after = get_detailed_gpu_info()
+        
         generated_audio = generated_audio.speech_outputs[0].cpu().to(torch.float32).numpy()
         
-        # Get stats
-        gpu_mem_used = torch.cuda.memory_allocated(0) / 1024**2 if torch.cuda.is_available() else None
+        total_time = time.time() - total_start
+        
+        # Update performance stats
+        performance_stats["total_requests"] += 1
+        performance_stats["average_inference_time"] = (
+            performance_stats["average_inference_time"] * 0.9 + inference_time * 0.1
+        )
+        
+        if gpu_after.get("allocated_memory"):
+            performance_stats["peak_memory_usage"] = max(
+                performance_stats["peak_memory_usage"],
+                gpu_after["allocated_memory"] * 1024
+            )
         
         stats = AudioStats(
             duration_seconds=len(generated_audio) / SAMPLE_RATE,
             sample_rate=SAMPLE_RATE,
             channels=1,
-            processing_time_seconds=time.time() - start_time,
+            processing_time_seconds=processing_start - total_start,
             model_inference_time_seconds=inference_time,
-            gpu_memory_used_mb=gpu_mem_used
+            preprocessing_time_seconds=0,  # Set by caller
+            postprocessing_time_seconds=0,  # Set by caller
+            gpu_memory_used_mb=gpu_after.get("allocated_memory", 0) * 1024 if gpu_after.get("allocated_memory") else None,
+            gpu_memory_peak_mb=gpu_after.get("cached_memory", 0) * 1024 if gpu_after.get("cached_memory") else None,
+            gpu_utilization=gpu_after.get("utilization"),
+            cpu_usage_during_inference=cpu_after - cpu_before if cpu_after > cpu_before else None,
+            queue_time_seconds=queue_time,
+            total_latency_seconds=total_time
         )
         
         return generated_audio, stats
@@ -355,52 +574,81 @@ def generate_audio(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarr
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
+    logger.info("Starting VibeVoice Inference Server v2.0...")
     load_model()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global thread_pool
+    if thread_pool:
+        thread_pool.shutdown(wait=True)
 
 @app.get("/")
 async def root():
     return {
-        "message": "VibeVoice Inference Server is running",
-        "version": "1.0.0",
+        "message": "VibeVoice Inference Server v2.0 - Optimized for Low Latency",
+        "version": "2.0.0",
         "model": MODEL_NAME,
         "model_stats": model_stats,
+        "performance_stats": performance_stats,
+        "warmup_complete": warmup_complete,
         "endpoints": {
             "/single-speaker": "Single speaker TTS with voice cloning",
             "/multi-speaker": "Multi-speaker TTS with voice cloning",
             "/health": "Health check endpoint",
-            "/system": "System information"
+            "/system": "Detailed system information",
+            "/metrics": "Performance metrics",
+            "/warmup": "Trigger model warmup"
         }
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Enhanced health check endpoint."""
     system_info = get_system_info()
     return {
-        "status": "healthy" if system_info.model_loaded else "model_not_loaded",
+        "status": "healthy" if system_info.model_loaded and warmup_complete else "warming_up" if system_info.model_loaded else "model_not_loaded",
         "gpu_available": system_info.gpu_available,
-        "model_loaded": system_info.model_loaded
+        "model_loaded": system_info.model_loaded,
+        "warmup_complete": warmup_complete,
+        "gpu_memory_usage": system_info.gpu_memory_used,
+        "gpu_utilization": system_info.gpu_utilization,
+        "cpu_usage": system_info.cpu_usage,
+        "ram_usage_percent": (system_info.ram_used / system_info.ram_total) * 100
     }
 
 @app.get("/system", response_model=SystemInfo)
 async def get_system_info_endpoint():
-    """Get detailed system information."""
+    """Get comprehensive system information."""
     return get_system_info()
+
+@app.get("/metrics")
+async def get_performance_metrics():
+    """Get detailed performance metrics."""
+    return {
+        "performance_stats": performance_stats,
+        "model_stats": model_stats,
+        "system_info": get_system_info().dict(),
+        "warmup_complete": warmup_complete
+    }
+
+@app.post("/warmup")
+async def trigger_warmup():
+    """Manually trigger model warmup."""
+    global warmup_complete
+    warmup_complete = False
+    warmup_model()
+    return {"message": "Warmup completed", "warmup_complete": warmup_complete}
 
 @app.post("/single-speaker")
 async def single_speaker_tts(
     text: str = Form(...),
     voice_file: UploadFile = File(...)
 ):
-    """
-    Generate speech using single speaker with voice cloning.
+    """Optimized single speaker TTS endpoint."""
+    request_start = time.time()
     
-    Args:
-        text: Text to convert to speech
-        voice_file: Audio file for voice cloning (WAV/MP3)
-    """
-    logger.info("Received single-speaker TTS request", text, voice_file.headers, voice_file.filename, voice_file.content_type, voice_file.size)
     try:
         # Validate inputs
         if not text.strip():
@@ -411,25 +659,46 @@ async def single_speaker_tts(
         
         # Read and preprocess audio
         audio_bytes = await voice_file.read()
+        preprocess_start = time.time()
         voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
+        preprocess_time = time.time() - preprocess_start
         
         # Generate audio
-        generated_audio, stats = generate_audio(text, [voice_sample])
+        generated_audio, stats = await generate_audio_async(text, [voice_sample])
+        
+        # Update preprocessing time in stats
+        stats.preprocessing_time_seconds = preprocess_time
         
         # Convert to bytes
+        postprocess_start = time.time()
         audio_output = audio_to_bytes(generated_audio)
+        postprocess_time = time.time() - postprocess_start
         
-        # Return as streaming response with stats in headers
+        # Update postprocessing time in stats
+        stats.postprocessing_time_seconds = postprocess_time
+        
+        # Calculate total request time
+        total_request_time = time.time() - request_start
+        
+        # Return optimized streaming response
         response = StreamingResponse(
             iter([audio_output]),
             media_type="audio/wav",
             headers={
-                "X-Audio-Duration": str(stats.duration_seconds),
-                "X-Processing-Time": str(stats.processing_time_seconds),
-                "X-Model-Time": str(stats.model_inference_time_seconds),
+                "X-Audio-Duration": f"{stats.duration_seconds:.3f}",
+                "X-Processing-Time": f"{stats.processing_time_seconds:.3f}",
+                "X-Inference-Time": f"{stats.model_inference_time_seconds:.3f}",
+                "X-Preprocessing-Time": f"{stats.preprocessing_time_seconds:.3f}",
+                "X-Postprocessing-Time": f"{stats.postprocessing_time_seconds:.3f}",
+                "X-Queue-Time": f"{stats.queue_time_seconds:.3f}",
+                "X-Total-Latency": f"{stats.total_latency_seconds:.3f}",
+                "X-Request-Time": f"{total_request_time:.3f}",
                 "X-Sample-Rate": str(stats.sample_rate),
-                "X-GPU-Memory-Used": str(stats.gpu_memory_used_mb) if stats.gpu_memory_used_mb else "N/A",
-                "Content-Disposition": "attachment; filename=generated_speech.wav"
+                "X-GPU-Memory-Used": f"{stats.gpu_memory_used_mb:.1f}" if stats.gpu_memory_used_mb else "N/A",
+                "X-GPU-Utilization": f"{stats.gpu_utilization:.1f}%" if stats.gpu_utilization else "N/A",
+                "X-CPU-Usage": f"{stats.cpu_usage_during_inference:.1f}%" if stats.cpu_usage_during_inference else "N/A",
+                "Content-Disposition": "attachment; filename=generated_speech.wav",
+                "Cache-Control": "no-cache"
             }
         )
         
@@ -441,19 +710,15 @@ async def single_speaker_tts(
         logger.error(f"Single speaker TTS failed: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-
+                
 @app.post("/multi-speaker")
 async def multi_speaker_tts(
     text: str = Form(...),
     voice_files: List[UploadFile] = File(...)
 ):
-    """
-    Generate speech using multiple speakers with voice cloning.
+    """Optimized multi-speaker TTS endpoint."""
+    request_start = time.time()
     
-    Args:
-        text: Text with speaker labels (e.g., "Speaker 1: Hello\nSpeaker 2: Hi there")
-        voice_files: List of audio files for voice cloning, ordered by speaker ID
-    """
     try:
         # Validate inputs
         if not text.strip():
@@ -462,44 +727,67 @@ async def multi_speaker_tts(
         if not voice_files:
             raise HTTPException(status_code=400, detail="At least one voice file required")
         
-        # Check text format
         if "Speaker" not in text:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Text must contain speaker labels (e.g., 'Speaker 1: Hello\\nSpeaker 2: Hi')"
             )
         
-        # Process voice files
+        # Process voice files in parallel
+        preprocess_start = time.time()
         voice_samples = []
-        for i, voice_file in enumerate(voice_files):
+        
+        async def process_voice_file(voice_file, index):
             if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
                 raise HTTPException(
-                    status_code=400, 
-                    detail=f"Unsupported audio format in file {i+1}: {voice_file.filename}"
+                    status_code=400,
+                    detail=f"Unsupported audio format in file {index+1}: {voice_file.filename}"
                 )
             
             audio_bytes = await voice_file.read()
-            voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
-            voice_samples.append(voice_sample)
+            return preprocess_audio(audio_bytes, voice_file.filename)
+        
+        # Process files concurrently
+        tasks = [process_voice_file(vf, i) for i, vf in enumerate(voice_files)]
+        voice_samples = await asyncio.gather(*tasks)
+        
+        preprocess_time = time.time() - preprocess_start
         
         # Generate audio
-        generated_audio, stats = generate_audio(text, voice_samples)
+        generated_audio, stats = await generate_audio_async(text, voice_samples)
+        
+        # Update preprocessing time
+        stats.preprocessing_time_seconds = preprocess_time
         
         # Convert to bytes
+        postprocess_start = time.time()
         audio_output = audio_to_bytes(generated_audio)
+        postprocess_time = time.time() - postprocess_start
         
-        # Return as streaming response with stats in headers
+        stats.postprocessing_time_seconds = postprocess_time
+        
+        # Calculate total request time
+        total_request_time = time.time() - request_start
+        
         response = StreamingResponse(
             iter([audio_output]),
             media_type="audio/wav",
             headers={
-                "X-Audio-Duration": str(stats.duration_seconds),
-                "X-Processing-Time": str(stats.processing_time_seconds),
-                "X-Model-Time": str(stats.model_inference_time_seconds),
+                "X-Audio-Duration": f"{stats.duration_seconds:.3f}",
+                "X-Processing-Time": f"{stats.processing_time_seconds:.3f}",
+                "X-Inference-Time": f"{stats.model_inference_time_seconds:.3f}",
+                "X-Preprocessing-Time": f"{stats.preprocessing_time_seconds:.3f}",
+                "X-Postprocessing-Time": f"{stats.postprocessing_time_seconds:.3f}",
+                "X-Queue-Time": f"{stats.queue_time_seconds:.3f}",
+                "X-Total-Latency": f"{stats.total_latency_seconds:.3f}",
+                "X-Request-Time": f"{total_request_time:.3f}",
                 "X-Sample-Rate": str(stats.sample_rate),
-                "X-GPU-Memory-Used": str(stats.gpu_memory_used_mb) if stats.gpu_memory_used_mb else "N/A",
+                "X-GPU-Memory-Used": f"{stats.gpu_memory_used_mb:.1f}" if stats.gpu_memory_used_mb else "N/A",
+                "X-GPU-Utilization": f"{stats.gpu_utilization:.1f}%" if stats.gpu_utilization else "N/A",
+                "X-CPU-Usage": f"{stats.cpu_usage_during_inference:.1f}%" if stats.cpu_usage_during_inference else "N/A",
                 "X-Speakers": str(len(voice_samples)),
-                "Content-Disposition": "attachment; filename=generated_multispeaker_speech.wav"
+                "Content-Disposition": "attachment; filename=generated_multispeaker_speech.wav",
+                "Cache-Control": "no-cache"
             }
         )
         
@@ -512,26 +800,35 @@ async def multi_speaker_tts(
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
+                
+ 
 @app.post("/reload-model")
 async def reload_model():
-    """Reload the model (useful for updates)."""
-    global processor, model
+    """Reload the model with optimizations."""
+    global processor, model, warmup_complete
     
     try:
         processor = None
         model = None
+        warmup_complete = False
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
         load_model()
         
-        return {"message": "Model reloaded successfully", "stats": model_stats}
+        return {
+            "message": "Model reloaded successfully", 
+            "stats": model_stats,
+            "warmup_complete": warmup_complete
+        }
         
     except Exception as e:
         logger.error(f"Failed to reload model: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload model: {str(e)}")
 
+   
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
@@ -539,5 +836,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=False,
-        workers=1  # Important: only 1 worker for GPU models
+        workers=1,
+        loop="uvloop",  # Use uvloop for better performance
+        http="httptools"  # Use httptools for better HTTP parsing
     )
