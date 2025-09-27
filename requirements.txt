@@ -28,6 +28,7 @@ pydantic>=2.4.0
 
 # System monitoring
 psutil>=5.9.0
+GPUtil>=1.4.0
 
 # Development and utilities
 python-dotenv>=1.0.0
