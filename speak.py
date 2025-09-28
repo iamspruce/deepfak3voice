@@ -43,7 +43,7 @@ MAX_AUDIO_LENGTH = 300  # 5 minutes max
 MAX_TEXT_LENGTH = 10000  # 10k characters max
 CFG_SCALE = 1.3
 DDPM_STEPS = 10
-MIN_VRAM_FOR_7B = 14  # GB
+MIN_VRAM_FOR_7B = 24  # GB
 
 # Performance optimizations
 WARMUP_ITERATIONS = 3
