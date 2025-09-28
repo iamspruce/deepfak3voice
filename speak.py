@@ -3,17 +3,18 @@ import time
 import io
 import wave
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 import traceback
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 import torch
 import numpy as np
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,17 +22,20 @@ import noisereduce as nr
 from huggingface_hub import snapshot_download
 import psutil
 import GPUtil
+from sse_starlette.sse import EventSourceResponse
 
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+from vibevoice.modular.streamer import AudioStreamer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-MODEL_NAME = "microsoft/VibeVoice-1.5B"
+# Configuration - Dynamic model selection
+MODEL_7B = "microsoft/VibeVoice-7B"
+MODEL_1_5B = "microsoft/VibeVoice-1.5B"
 MODELS_DIR = Path("./models")
 MODELS_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 24000
@@ -39,6 +43,7 @@ MAX_AUDIO_LENGTH = 300  # 5 minutes max
 MAX_TEXT_LENGTH = 10000  # 10k characters max
 CFG_SCALE = 1.3
 DDPM_STEPS = 10
+MIN_VRAM_FOR_7B = 14  # GB
 
 # Performance optimizations
 WARMUP_ITERATIONS = 3
@@ -47,8 +52,8 @@ AUDIO_CACHE_SIZE = 100
 
 app = FastAPI(
     title="VibeVoice Inference Server",
-    description="FastAPI server for VibeVoice text-to-speech with low latency",
-    version="2.0.0"
+    description="FastAPI server for VibeVoice text-to-speech with streaming and dynamic model selection",
+    version="2.1.0"
 )
 
 # Add CORS middleware
@@ -61,7 +66,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, # Only allows your specified domains
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -74,6 +79,7 @@ device = None
 model_stats = {}
 thread_pool = None
 warmup_complete = False
+current_model_name = None
 
 # Performance monitoring
 performance_stats = {
@@ -83,7 +89,8 @@ performance_stats = {
     "average_postprocessing_time": 0,
     "peak_memory_usage": 0,
     "cache_hits": 0,
-    "cache_misses": 0
+    "cache_misses": 0,
+    "streaming_requests": 0
 }
 
 class SystemInfo(BaseModel):
@@ -101,6 +108,7 @@ class SystemInfo(BaseModel):
     ram_used: float
     model_loaded: bool
     model_path: Optional[str]
+    current_model: Optional[str]
     warmup_complete: bool
     performance_stats: Dict[str, Any]
 
@@ -118,6 +126,11 @@ class AudioStats(BaseModel):
     cpu_usage_during_inference: Optional[float]
     queue_time_seconds: float
     total_latency_seconds: float
+
+class StreamingConfig(BaseModel):
+    chunk_duration_ms: int = 200  # Duration of each audio chunk in milliseconds
+    buffer_size: int = 4  # Number of chunks to buffer
+    sample_rate: int = 24000
 
 def get_detailed_gpu_info():
     """Get comprehensive GPU information."""
@@ -167,6 +180,20 @@ def get_detailed_gpu_info():
         "temperature": None
     }
 
+def select_optimal_model():
+    """Select the optimal model based on GPU VRAM availability."""
+    gpu_info = get_detailed_gpu_info()
+    
+    if gpu_info["available"] and gpu_info["total_memory"] >= MIN_VRAM_FOR_7B:
+        logger.info(f"GPU has {gpu_info['total_memory']:.1f}GB VRAM, selecting 7B model")
+        return MODEL_7B
+    else:
+        if gpu_info["available"]:
+            logger.info(f"GPU has {gpu_info['total_memory']:.1f}GB VRAM (< {MIN_VRAM_FOR_7B}GB), selecting 1.5B model")
+        else:
+            logger.info("No GPU available, selecting 1.5B model for CPU inference")
+        return MODEL_1_5B
+
 def check_gpu_compatibility():
     """Check if compatible GPU is available and return device info."""
     global device
@@ -202,20 +229,21 @@ def get_system_info() -> SystemInfo:
         ram_available=memory.available / 1024**3,
         ram_used=memory.used / 1024**3,
         model_loaded=model is not None,
-        model_path=str(MODELS_DIR / MODEL_NAME) if model else None,
+        model_path=str(MODELS_DIR / current_model_name.replace("/", "_")) if current_model_name else None,
+        current_model=current_model_name,
         warmup_complete=warmup_complete,
         performance_stats=performance_stats
     )
 
-def download_model():
+def download_model(model_name: str):
     """Download model if not already present."""
-    model_path = MODELS_DIR / MODEL_NAME.replace("/", "_")
+    model_path = MODELS_DIR / model_name.replace("/", "_")
     
     if not model_path.exists():
-        logger.info(f"Downloading model {MODEL_NAME} to {model_path}")
+        logger.info(f"Downloading model {model_name} to {model_path}")
         try:
             snapshot_download(
-                repo_id=MODEL_NAME,
+                repo_id=model_name,
                 local_dir=model_path,
             )
             logger.info(f"Model downloaded successfully to {model_path}")
@@ -282,7 +310,7 @@ def warmup_model():
 
 def load_model():
     """Load the VibeVoice model and processor with optimizations."""
-    global processor, model, model_stats, thread_pool
+    global processor, model, model_stats, thread_pool, current_model_name
 
     if model is not None:
         return
@@ -298,8 +326,12 @@ def load_model():
         if not gpu_available:
             logger.warning("No GPU available - model performance may be slow")
 
+        # Select optimal model based on hardware
+        current_model_name = select_optimal_model()
+        logger.info(f"Selected model: {current_model_name}")
+
         # Download model if needed
-        model_path = download_model()
+        model_path = download_model(current_model_name)
 
         # Load processor
         logger.info("Loading VibeVoice processor...")
@@ -359,6 +391,7 @@ def load_model():
         
         # Collect model stats
         model_stats = {
+            "model_name": current_model_name,
             "load_time_seconds": load_time,
             "device": str(device),
             "torch_dtype": str(load_dtype),
@@ -443,6 +476,24 @@ def audio_to_bytes(audio: np.ndarray) -> bytes:
     
     return byte_io.getvalue()
 
+def audio_chunk_to_bytes(audio_chunk: torch.Tensor) -> bytes:
+    """Convert a single audio chunk to bytes for streaming."""
+    # Convert tensor to numpy
+    if isinstance(audio_chunk, torch.Tensor):
+        audio = audio_chunk.detach().cpu().numpy()
+    else:
+        audio = audio_chunk
+    
+    # Ensure it's 1D
+    if audio.ndim > 1:
+        audio = np.squeeze(audio)
+    
+    # Normalize and convert to int16
+    audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
+    audio_int16 = (audio * 32767).astype(np.int16)
+    
+    return audio_int16.tobytes()
+
 async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarray, AudioStats]:
     """Asynchronous audio generation with detailed stats."""
     if model is None or processor is None:
@@ -474,7 +525,7 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
             else:
                 formatted_text = text
         
-        formatted_text = formatted_text.replace("â€™", "'")
+        formatted_text = formatted_text.replace("Ã¢â‚¬â„¢", "'")
         
         # Track CPU usage before inference
         cpu_before = psutil.cpu_percent(interval=None)
@@ -574,9 +625,135 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
+async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -> AsyncGenerator[Dict[str, Any], None]:
+    """Generate streaming audio with real-time chunks."""
+    if model is None or processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    if not warmup_complete:
+        raise HTTPException(status_code=503, detail="Model is still warming up")
+    
+    try:
+        # Format text
+        num_speakers = len(voice_samples)
+        if num_speakers == 1:
+            formatted_text = f"Speaker 1: {text.strip()}"
+        else:
+            if "Speaker" not in text:
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                if lines:
+                    formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
+                    formatted_text = "\n".join(formatted_lines)
+                else:
+                    formatted_text = text
+            else:
+                formatted_text = text
+        
+        formatted_text = formatted_text.replace("Ã¢â‚¬â„¢", "'")
+        
+        # Process inputs
+        inputs = processor(
+            text=[formatted_text],
+            voice_samples=voice_samples,
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        
+        # Move to device
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(device, non_blocking=True)
+        
+        # Setup audio streamer
+        audio_streamer = AudioStreamer(batch_size=1)
+        
+        # Create a stop flag that can be controlled externally
+        stop_flag = asyncio.Event()
+        
+        def should_stop():
+            return stop_flag.is_set()
+        
+        # Start generation in a separate task
+        generation_task = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: model.generate(
+                    **inputs,
+                    max_new_tokens=None,
+                    cfg_scale=CFG_SCALE,
+                    tokenizer=processor.tokenizer,
+                    generation_config={'do_sample': False},
+                    verbose=False,
+                    audio_streamer=audio_streamer,
+                    stop_check_fn=should_stop,
+                )
+            )
+        )
+        
+        # Stream audio chunks as they become available
+        chunk_count = 0
+        try:
+            # Get stream for the first (and only) sample in batch
+            audio_stream = audio_streamer.get_stream(0)
+            
+            for audio_chunk in audio_stream:
+                if audio_chunk is None:
+                    break
+                
+                chunk_count += 1
+                
+                # Convert audio chunk to bytes
+                audio_bytes = audio_chunk_to_bytes(audio_chunk)
+                
+                # Create the streaming data
+                chunk_data = {
+                    "type": "audio_chunk",
+                    "chunk_id": chunk_count,
+                    "audio_data": audio_bytes.hex(),  # Convert to hex for JSON serialization
+                    "sample_rate": SAMPLE_RATE,
+                    "duration_ms": len(audio_chunk) / SAMPLE_RATE * 1000,
+                    "timestamp": time.time()
+                }
+                
+                yield chunk_data
+        
+        except Exception as e:
+            logger.error(f"Error in streaming: {e}")
+            stop_flag.set()  # Signal to stop generation
+            yield {
+                "type": "error",
+                "message": str(e),
+                "timestamp": time.time()
+            }
+        
+        finally:
+            # Wait for generation to complete
+            try:
+                await generation_task
+            except Exception as e:
+                logger.error(f"Generation task error: {e}")
+            
+            # Send completion signal
+            yield {
+                "type": "complete",
+                "total_chunks": chunk_count,
+                "timestamp": time.time()
+            }
+        
+        # Update streaming stats
+        performance_stats["streaming_requests"] += 1
+        
+    except Exception as e:
+        logger.error(f"Streaming generation failed: {e}")
+        yield {
+            "type": "error", 
+            "message": str(e),
+            "timestamp": time.time()
+        }
+
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting VibeVoice Inference Server v2.0...")
+    logger.info("Starting VibeVoice Inference Server v2.1...")
     load_model()
 
 @app.on_event("shutdown")
@@ -588,15 +765,17 @@ async def shutdown_event():
 @app.get("/")
 async def root():
     return {
-        "message": "VibeVoice Inference Server v2.0 - Optimized for Low Latency",
-        "version": "2.0.0",
-        "model": MODEL_NAME,
+        "message": "VibeVoice Inference Server v2.1 - Dynamic Model Selection & Streaming",
+        "version": "2.1.0",
+        "current_model": current_model_name,
         "model_stats": model_stats,
         "performance_stats": performance_stats,
         "warmup_complete": warmup_complete,
         "endpoints": {
             "/single-speaker": "Single speaker TTS with voice cloning",
-            "/multi-speaker": "Multi-speaker TTS with voice cloning",
+            "/multi-speaker": "Multi-speaker TTS with voice cloning", 
+            "/single-speaker-stream": "Single speaker TTS with SSE streaming",
+            "/multi-speaker-stream": "Multi-speaker TTS with SSE streaming",
             "/health": "Health check endpoint",
             "/system": "Detailed system information",
             "/metrics": "Performance metrics",
@@ -612,6 +791,7 @@ async def health_check():
         "status": "healthy" if system_info.model_loaded and warmup_complete else "warming_up" if system_info.model_loaded else "model_not_loaded",
         "gpu_available": system_info.gpu_available,
         "model_loaded": system_info.model_loaded,
+        "current_model": current_model_name,
         "warmup_complete": warmup_complete,
         "gpu_memory_usage": system_info.gpu_memory_used,
         "gpu_utilization": system_info.gpu_utilization,
@@ -698,6 +878,7 @@ async def single_speaker_tts(
                 "X-GPU-Memory-Used": f"{stats.gpu_memory_used_mb:.1f}" if stats.gpu_memory_used_mb else "N/A",
                 "X-GPU-Utilization": f"{stats.gpu_utilization:.1f}%" if stats.gpu_utilization else "N/A",
                 "X-CPU-Usage": f"{stats.cpu_usage_during_inference:.1f}%" if stats.cpu_usage_during_inference else "N/A",
+                "X-Model-Used": current_model_name,
                 "Content-Disposition": "attachment; filename=generated_speech.wav",
                 "Cache-Control": "no-cache"
             }
@@ -711,7 +892,7 @@ async def single_speaker_tts(
         logger.error(f"Single speaker TTS failed: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-                
+
 @app.post("/multi-speaker")
 async def multi_speaker_tts(
     text: str = Form(...),
@@ -787,6 +968,7 @@ async def multi_speaker_tts(
                 "X-GPU-Utilization": f"{stats.gpu_utilization:.1f}%" if stats.gpu_utilization else "N/A",
                 "X-CPU-Usage": f"{stats.cpu_usage_during_inference:.1f}%" if stats.cpu_usage_during_inference else "N/A",
                 "X-Speakers": str(len(voice_samples)),
+                "X-Model-Used": current_model_name,
                 "Content-Disposition": "attachment; filename=generated_multispeaker_speech.wav",
                 "Cache-Control": "no-cache"
             }
@@ -801,8 +983,91 @@ async def multi_speaker_tts(
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-                
- 
+@app.post("/single-speaker-stream")
+async def single_speaker_tts_stream(
+    text: str = Form(...),
+    voice_file: UploadFile = File(...)
+):
+    """Single speaker TTS with real-time streaming via SSE."""
+    try:
+        # Validate inputs
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Text cannot be empty")
+        
+        if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
+            raise HTTPException(status_code=400, detail="Unsupported audio format")
+        
+        # Read and preprocess audio
+        audio_bytes = await voice_file.read()
+        voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
+        
+        # Create async generator for streaming
+        async def stream_generator():
+            async for chunk_data in generate_streaming_audio(text, [voice_sample]):
+                yield {
+                    "event": chunk_data["type"],
+                    "data": json.dumps(chunk_data)
+                }
+        
+        return EventSourceResponse(stream_generator(), media_type="text/plain")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Single speaker streaming failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/multi-speaker-stream")
+async def multi_speaker_tts_stream(
+    text: str = Form(...),
+    voice_files: List[UploadFile] = File(...)
+):
+    """Multi-speaker TTS with real-time streaming via SSE."""
+    try:
+        # Validate inputs
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Text cannot be empty")
+        
+        if not voice_files:
+            raise HTTPException(status_code=400, detail="At least one voice file required")
+        
+        if "Speaker" not in text:
+            raise HTTPException(
+                status_code=400,
+                detail="Text must contain speaker labels (e.g., 'Speaker 1: Hello\\nSpeaker 2: Hi')"
+            )
+        
+        # Process voice files
+        async def process_voice_file(voice_file, index):
+            if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported audio format in file {index+1}: {voice_file.filename}"
+                )
+            
+            audio_bytes = await voice_file.read()
+            return preprocess_audio(audio_bytes, voice_file.filename)
+        
+        # Process files concurrently
+        tasks = [process_voice_file(vf, i) for i, vf in enumerate(voice_files)]
+        voice_samples = await asyncio.gather(*tasks)
+        
+        # Create async generator for streaming
+        async def stream_generator():
+            async for chunk_data in generate_streaming_audio(text, voice_samples):
+                yield {
+                    "event": chunk_data["type"],
+                    "data": json.dumps(chunk_data)
+                }
+        
+        return EventSourceResponse(stream_generator(), media_type="text/plain")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Multi-speaker streaming failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
@@ -820,6 +1085,7 @@ async def reload_model():
         
         return {
             "message": "Model reloaded successfully", 
+            "current_model": current_model_name,
             "stats": model_stats,
             "warmup_complete": warmup_complete
         }
@@ -828,8 +1094,6 @@ async def reload_model():
         logger.error(f"Failed to reload model: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload model: {str(e)}")
 
-   
-    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
