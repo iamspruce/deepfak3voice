@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration - Dynamic model selection
-MODEL_7B = "vibevoice/VibeVoice-7B"
+MODEL_7B = "aoi-ot/VibeVoice-Large"
 MODEL_1_5B = "microsoft/VibeVoice-1.5B"
 MODELS_DIR = Path("./models")
 MODELS_DIR.mkdir(exist_ok=True)
@@ -354,8 +354,10 @@ def load_model():
                 torch_dtype=load_dtype,
                 attn_implementation=attn_impl_primary,
                 device_map="auto" if str(device) == "cuda" else None,
-                low_cpu_mem_usage=True,
+                low_cpu_mem_usage=True,  # Memory optimization
             )
+            if str(device) != "cuda":
+                model.to(device)
         except Exception as e:
             logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'sdpa'.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
@@ -365,18 +367,9 @@ def load_model():
                 device_map="auto" if str(device) == "cuda" else None,
                 low_cpu_mem_usage=True,
             )
+            if str(device) != "cuda":
+                model.to(device)
         
-        ### FIX: Always force model + all parameters onto the chosen device
-        model.to(device)
-        for name, param in model.named_parameters():
-            if param.device != device:
-                logger.warning(f"Parameter {name} is on {param.device}, moving it to {device}")
-                param.data = param.data.to(device)
-        for name, buf in model.named_buffers():
-            if buf.device != device:
-                logger.warning(f"Buffer {name} is on {buf.device}, moving it to {device}")
-                buf.data = buf.data.to(device)
-
         # Model optimizations
         model.eval()
         model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
@@ -414,7 +407,6 @@ def load_model():
         logger.error(f"Failed to load model: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
-
 
 def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
     """audio preprocessing with better performance."""
