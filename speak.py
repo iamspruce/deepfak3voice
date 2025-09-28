@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration - Dynamic model selection
-MODEL_7B = "microsoft/VibeVoice-7B"
+MODEL_7B = "vibevoice/VibeVoice-7B"
 MODEL_1_5B = "microsoft/VibeVoice-1.5B"
 MODELS_DIR = Path("./models")
 MODELS_DIR.mkdir(exist_ok=True)
