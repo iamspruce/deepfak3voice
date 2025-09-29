@@ -7,8 +7,6 @@ from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 import traceback
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import json
 
 import torch
 import numpy as np
@@ -23,6 +21,7 @@ from huggingface_hub import snapshot_download
 import psutil
 import GPUtil
 from sse_starlette.sse import EventSourceResponse
+import json
 
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -43,17 +42,16 @@ MAX_AUDIO_LENGTH = 300  # 5 minutes max
 MAX_TEXT_LENGTH = 10000  # 10k characters max
 CFG_SCALE = 1.3
 DDPM_STEPS = 10
-MIN_VRAM_FOR_7B = 24  # GB
+MIN_VRAM_FOR_7B = 14  # GB - More realistic requirement (was 24)
 
 # Performance optimizations
 WARMUP_ITERATIONS = 3
-THREAD_POOL_SIZE = 4
 AUDIO_CACHE_SIZE = 100
 
 app = FastAPI(
     title="VibeVoice Inference Server",
     description="FastAPI server for VibeVoice text-to-speech with streaming and dynamic model selection",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 # Add CORS middleware
@@ -77,7 +75,6 @@ processor = None
 model = None
 device = None
 model_stats = {}
-thread_pool = None
 warmup_complete = False
 current_model_name = None
 
@@ -209,6 +206,34 @@ def check_gpu_compatibility():
         logger.warning("No CUDA GPU available, falling back to CPU")
         return False, gpu_info
 
+def check_flash_attn_available():
+    """Check if flash-attn is installed and usable."""
+    try:
+        import flash_attn
+        # Check if GPU supports it (requires Ampere or newer - compute capability 8.0+)
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            if major >= 8:
+                return True
+            else:
+                logger.info(f"GPU compute capability {major}.x < 8.0, flash attention not supported")
+                return False
+        return False
+    except ImportError:
+        return False
+
+def get_optimal_attention_mode():
+    """Determine best attention mode based on hardware and availability."""
+    if str(device) != "cuda":
+        return "sdpa"  # CPU always uses SDPA
+    
+    if check_flash_attn_available():
+        logger.info("Flash Attention 2 available and supported")
+        return "flash_attention_2"
+    else:
+        logger.info("Flash Attention not available, using SDPA")
+        return "sdpa"
+
 def get_system_info() -> SystemInfo:
     """Get comprehensive system information."""
     gpu_available, gpu_info = check_gpu_compatibility()
@@ -258,6 +283,13 @@ def warmup_model():
     global warmup_complete
     
     if not model or not processor:
+        logger.warning("Model or processor not loaded, skipping warmup")
+        warmup_complete = False
+        return
+    
+    if not hasattr(model, 'generate'):
+        logger.warning("Model doesn't have generate method, skipping warmup")
+        warmup_complete = False
         return
     
     logger.info("Starting model warmup...")
@@ -306,11 +338,12 @@ def warmup_model():
         
     except Exception as e:
         logger.error(f"Model warmup failed: {e}")
+        logger.error(traceback.format_exc())
         warmup_complete = False
 
 def load_model():
     """Load the VibeVoice model and processor with optimizations."""
-    global processor, model, model_stats, thread_pool, current_model_name
+    global processor, model, model_stats, current_model_name
 
     if model is not None:
         return
@@ -318,9 +351,6 @@ def load_model():
     start_time = time.time()
     
     try:
-        # Initialize thread pool
-        thread_pool = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
-        
         # Check GPU compatibility first
         gpu_available, gpu_info = check_gpu_compatibility()
         if not gpu_available:
@@ -337,10 +367,10 @@ def load_model():
         logger.info("Loading VibeVoice processor...")
         processor = VibeVoiceProcessor.from_pretrained(str(model_path))
         
-        # Optimize model loading
+        # Determine optimal dtype and attention mode
         if str(device) == "cuda":
             load_dtype = torch.bfloat16
-            attn_impl_primary = "flash_attention_2"
+            attn_impl_primary = get_optimal_attention_mode()
         else:
             load_dtype = torch.float32
             attn_impl_primary = "sdpa"
@@ -353,38 +383,29 @@ def load_model():
                 str(model_path),
                 torch_dtype=load_dtype,
                 attn_implementation=attn_impl_primary,
-                device_map="auto" if str(device) == "cuda" else None,
-                low_cpu_mem_usage=True,  # Memory optimization
+                device_map=None,  # Don't use device_map="auto" without quantization
+                low_cpu_mem_usage=True,
             )
-            if str(device) != "cuda":
-                model.to(device)
+            # Manually move to device
+            model.to(device)
+            logger.info(f"Model loaded successfully with {attn_impl_primary} attention")
+            
         except Exception as e:
-            logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'sdpa'.")
+            logger.warning(f"Failed to load with '{attn_impl_primary}': {e}. Falling back to 'eager'.")
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 str(model_path),
                 torch_dtype=load_dtype,
-                attn_implementation="sdpa",
-                device_map="auto" if str(device) == "cuda" else None,
+                attn_implementation="eager",
+                device_map=None,
                 low_cpu_mem_usage=True,
             )
-            if str(device) != "cuda":
-                model.to(device)
+            model.to(device)
+            attn_impl_primary = "eager"
+            logger.info("Model loaded successfully with eager attention (fallback)")
         
         # Model optimizations
         model.eval()
         model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
-        
-        # Enable optimizations
-        if hasattr(model, 'half') and str(device) == "cuda":
-            model = model.half()  # Use FP16 for faster inference
-        
-        # Compile model for PyTorch 2.0+ (if available)
-        try:
-            if hasattr(torch, 'compile'):
-                model = torch.compile(model, mode="reduce-overhead")
-                logger.info("Model compiled with torch.compile for better performance")
-        except Exception as e:
-            logger.warning(f"Failed to compile model: {e}")
         
         load_time = time.time() - start_time
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
@@ -397,7 +418,6 @@ def load_model():
             "torch_dtype": str(load_dtype),
             "attn_implementation": attn_impl_primary,
             "memory_usage_mb": gpu_info.get("allocated_memory", 0) * 1024 if gpu_info.get("allocated_memory") else 0,
-            "compiled": hasattr(model, '_dynamo_orig_callable') if hasattr(torch, 'compile') else False
         }
         
         # Perform warmup
@@ -409,7 +429,7 @@ def load_model():
         raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
 
 def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
-    """audio preprocessing with better performance."""
+    """Audio preprocessing with better performance."""
     preprocess_start = time.time()
     
     try:
@@ -448,7 +468,7 @@ def preprocess_audio(audio_bytes: bytes, filename: str) -> np.ndarray:
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
 
 def audio_to_bytes(audio: np.ndarray) -> bytes:
-    """audio conversion to bytes."""
+    """Audio conversion to bytes."""
     postprocess_start = time.time()
     
     # Vectorized operations
@@ -525,7 +545,7 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
             else:
                 formatted_text = text
         
-        formatted_text = formatted_text.replace("Ã¢â‚¬â„¢", "'")
+        formatted_text = formatted_text.replace("ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢", "'")
         
         # Track CPU usage before inference
         cpu_before = psutil.cpu_percent(interval=None)
@@ -633,6 +653,25 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
     if not warmup_complete:
         raise HTTPException(status_code=503, detail="Model is still warming up")
     
+    # Check if streaming is supported
+    if not hasattr(model, 'generate'):
+        logger.warning("Streaming not supported, falling back to batch generation")
+        try:
+            generated_audio, _ = await generate_audio_async(text, voice_samples)
+            yield {
+                "type": "audio_chunk",
+                "chunk_id": 1,
+                "audio_data": audio_chunk_to_bytes(generated_audio).hex(),
+                "sample_rate": SAMPLE_RATE,
+                "duration_ms": len(generated_audio) / SAMPLE_RATE * 1000,
+                "timestamp": time.time()
+            }
+            yield {"type": "complete", "total_chunks": 1, "timestamp": time.time()}
+            return
+        except Exception as e:
+            yield {"type": "error", "message": str(e), "timestamp": time.time()}
+            return
+    
     try:
         # Format text
         num_speakers = len(voice_samples)
@@ -649,7 +688,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             else:
                 formatted_text = text
         
-        formatted_text = formatted_text.replace("Ã¢â‚¬â„¢", "'")
+        formatted_text = formatted_text.replace("ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢", "'")
         
         # Process inputs
         inputs = processor(
@@ -753,20 +792,14 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting VibeVoice Inference Server v2.1...")
+    logger.info("Starting VibeVoice Inference Server v2.2...")
     load_model()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global thread_pool
-    if thread_pool:
-        thread_pool.shutdown(wait=True)
 
 @app.get("/")
 async def root():
     return {
-        "message": "VibeVoice Inference Server v2.1 - Dynamic Model Selection & Streaming",
-        "version": "2.1.0",
+        "message": "VibeVoice Inference Server v2.2 - Dynamic Model Selection & Streaming",
+        "version": "2.2.0",
         "current_model": current_model_name,
         "model_stats": model_stats,
         "performance_stats": performance_stats,
@@ -1009,7 +1042,7 @@ async def single_speaker_tts_stream(
                     "data": json.dumps(chunk_data)
                 }
         
-        return EventSourceResponse(stream_generator(), media_type="text/plain")
+        return EventSourceResponse(stream_generator(), media_type="text/event-stream")
         
     except HTTPException:
         raise
@@ -1060,7 +1093,7 @@ async def multi_speaker_tts_stream(
                     "data": json.dumps(chunk_data)
                 }
         
-        return EventSourceResponse(stream_generator(), media_type="text/plain")
+        return EventSourceResponse(stream_generator(), media_type="text/event-stream")
         
     except HTTPException:
         raise
