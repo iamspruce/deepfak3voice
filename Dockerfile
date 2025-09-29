@@ -2,7 +2,7 @@
 # Multi-stage build for optimized image size
 
 # Build stage
-FROM nvidia/cuda:12.1-devel-ubuntu22.04 as builder
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 as builder
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it"
 
 # Runtime stage
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
