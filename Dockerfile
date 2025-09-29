@@ -41,6 +41,9 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
+# Attempt to install flash-attn (optional, continue if fails)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it"
+
 # Runtime stage
 FROM nvidia/cuda:12.1-runtime-ubuntu22.04
 
@@ -89,7 +92,7 @@ EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "speak:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 
 # Labels for metadata
-LABEL maintainer="Your Name <your.email@domain.com>"
+LABEL maintainer="Spruce Emmanuel <hello@spruceemmanuel.com>"
 LABEL description="VibeVoice Inference Server with FastAPI"
 LABEL version="1.0.0"
 LABEL gpu.required="true"
