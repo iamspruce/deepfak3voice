@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
     \
     # Attempt to install flash-attn (optional, continue if fails)
-    [cite_start]pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it" [cite: 2, 3] && \
+    pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it"  && \
     \
     # Clean up build-time dependencies and apt caches to save space
     apt-get purge -y --auto-remove build-essential cmake git wget curl libffi-dev libssl-dev libsox-dev pkg-config && \
