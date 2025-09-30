@@ -647,29 +647,12 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
 async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate streaming audio with real-time chunks."""
     if model is None or processor is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        yield {"type": "error", "message": "Model not loaded", "timestamp": time.time()}
+        return
     
     if not warmup_complete:
-        raise HTTPException(status_code=503, detail="Model is still warming up")
-    
-    # Check if streaming is supported
-    if not hasattr(model, 'generate'):
-        logger.warning("Streaming not supported, falling back to batch generation")
-        try:
-            generated_audio, _ = await generate_audio_async(text, voice_samples)
-            yield {
-                "type": "audio_chunk",
-                "chunk_id": 1,
-                "audio_data": audio_chunk_to_bytes(generated_audio).hex(),
-                "sample_rate": SAMPLE_RATE,
-                "duration_ms": len(generated_audio) / SAMPLE_RATE * 1000,
-                "timestamp": time.time()
-            }
-            yield {"type": "complete", "total_chunks": 1, "timestamp": time.time()}
-            return
-        except Exception as e:
-            yield {"type": "error", "message": str(e), "timestamp": time.time()}
-            return
+        yield {"type": "error", "message": "Model warming up", "timestamp": time.time()}
+        return
     
     try:
         # Format text
@@ -687,7 +670,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             else:
                 formatted_text = text
         
-        formatted_text = formatted_text.replace("ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢", "'")
+        formatted_text = formatted_text.replace("ÃƒÆ'Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢", "'")
         
         # Process inputs
         inputs = processor(
@@ -703,41 +686,57 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             if torch.is_tensor(v):
                 inputs[k] = v.to(device, non_blocking=True)
         
-        # Setup audio streamer
-        audio_streamer = AudioStreamer(batch_size=1)
+        # Use AsyncAudioStreamer for async context
+        from vibevoice.modular.streamer import AsyncAudioStreamer
+        audio_streamer = AsyncAudioStreamer(batch_size=1)
         
-        # Create a stop flag that can be controlled externally
-        stop_flag = asyncio.Event()
+        # Create thread-safe stop flag
+        stop_flag = threading.Event()
         
         def should_stop():
             return stop_flag.is_set()
         
-        # Start generation in a separate task
+        # Start generation in a separate thread
+        def run_generation():
+            try:
+                with torch.inference_mode():
+                    if str(device) == "cuda" and torch.cuda.is_available():
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            model.generate(
+                                **inputs,
+                                max_new_tokens=None,
+                                cfg_scale=CFG_SCALE,
+                                tokenizer=processor.tokenizer,
+                                generation_config={'do_sample': False},
+                                verbose=False,
+                                audio_streamer=audio_streamer,
+                                stop_check_fn=should_stop,
+                            )
+                    else:
+                        model.generate(
+                            **inputs,
+                            max_new_tokens=None,
+                            cfg_scale=CFG_SCALE,
+                            tokenizer=processor.tokenizer,
+                            generation_config={'do_sample': False},
+                            verbose=False,
+                            audio_streamer=audio_streamer,
+                            stop_check_fn=should_stop,
+                        )
+            except Exception as e:
+                logger.error(f"Generation error: {e}")
+                logger.error(traceback.format_exc())
+        
+        # Start generation in thread
         generation_task = asyncio.create_task(
-            asyncio.to_thread(
-                lambda: model.generate(
-                    **inputs,
-                    max_new_tokens=None,
-                    cfg_scale=CFG_SCALE,
-                    tokenizer=processor.tokenizer,
-                    generation_config={'do_sample': False},
-                    verbose=False,
-                    audio_streamer=audio_streamer,
-                    stop_check_fn=should_stop,
-                )
-            )
+            asyncio.to_thread(run_generation)
         )
         
         # Stream audio chunks as they become available
         chunk_count = 0
         try:
-            # Get stream for the first (and only) sample in batch
-            audio_stream = audio_streamer.get_stream(0)
-            
-            for audio_chunk in audio_stream:
-                if audio_chunk is None:
-                    break
-                
+            # Use async iteration with AsyncAudioStreamer
+            async for audio_chunk in audio_streamer.get_stream(0):
                 chunk_count += 1
                 
                 # Convert audio chunk to bytes
@@ -747,7 +746,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
                 chunk_data = {
                     "type": "audio_chunk",
                     "chunk_id": chunk_count,
-                    "audio_data": audio_bytes.hex(),  # Convert to hex for JSON serialization
+                    "audio_data": audio_bytes.hex(),
                     "sample_rate": SAMPLE_RATE,
                     "duration_ms": len(audio_chunk) / SAMPLE_RATE * 1000,
                     "timestamp": time.time()
@@ -757,6 +756,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         
         except Exception as e:
             logger.error(f"Error in streaming: {e}")
+            logger.error(traceback.format_exc())
             stop_flag.set()  # Signal to stop generation
             yield {
                 "type": "error",
@@ -783,6 +783,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         
     except Exception as e:
         logger.error(f"Streaming generation failed: {e}")
+        logger.error(traceback.format_exc())
         yield {
             "type": "error", 
             "message": str(e),
@@ -1022,33 +1023,47 @@ async def single_speaker_tts_stream(
 ):
     """Single speaker TTS with real-time streaming via SSE."""
     try:
-        # Validate inputs
         if not text.strip():
             raise HTTPException(status_code=400, detail="Text cannot be empty")
         
         if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
             raise HTTPException(status_code=400, detail="Unsupported audio format")
         
-        # Read and preprocess audio
         audio_bytes = await voice_file.read()
         voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
         
         # Create async generator for streaming
         async def stream_generator():
-            async for chunk_data in generate_streaming_audio(text, [voice_sample]):
+            try:
+                async for chunk_data in generate_streaming_audio(text, [voice_sample]):
+                    # Format as standard SSE
+                    event_type = chunk_data.pop("type", "message")
+                    yield {
+                        "event": event_type,
+                        "data": json.dumps(chunk_data)
+                    }
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
                 yield {
-                    "event": chunk_data["type"],
-                    "data": json.dumps(chunk_data)
+                    "event": "error",
+                    "data": json.dumps({"message": str(e)})
                 }
         
-        return EventSourceResponse(stream_generator(), media_type="text/event-stream")
+        return EventSourceResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"  # Disable nginx buffering
+            }
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Single speaker streaming failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 @app.post("/multi-speaker-stream")
 async def multi_speaker_tts_stream(
     text: str = Form(...),
