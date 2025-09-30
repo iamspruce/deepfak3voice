@@ -1,5 +1,4 @@
 # VibeVoice Inference Server Dockerfile
-# Multi-stage build for optimized image size
 
 # Build stage
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 as builder
@@ -9,11 +8,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3.10-dev \
-    python3-pip \
+# Create and activate virtual environment
+RUN python3.10 -m pip install --upgrade pip setuptools wheel
+RUN python3.10 -m pip install virtualenv
+RUN python3.10 -m virtualenv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy requirements first for better Docker layer caching
+COPY requirements.txt /tmp/requirements.txt
+
+# Install build-time dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     git \
@@ -25,24 +30,20 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     sox \
     libsox-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    pkg-config && \
+    \
+    # Install Python dependencies from requirements.txt
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    \
+    # Attempt to install flash-attn (optional, continue if fails)
+    [cite_start]pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it" [cite: 2, 3] && \
+    \
+    # Clean up build-time dependencies and apt caches to save space
+    apt-get purge -y --auto-remove build-essential cmake git wget curl libffi-dev libssl-dev libsox-dev pkg-config && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create and activate virtual environment
-RUN python3.10 -m pip install --upgrade pip setuptools wheel
-RUN python3.10 -m pip install virtualenv
-RUN python3.10 -m virtualenv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy requirements first for better Docker layer caching
-COPY requirements.txt /tmp/requirements.txt
-
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /tmp/requirements.txt
-
-# Attempt to install flash-attn (optional, continue if fails)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation || echo "flash-attn installation failed, continuing without it"
 
 # Runtime stage
 FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
@@ -75,15 +76,15 @@ WORKDIR /home/app
 
 # Copy application code
 COPY --chown=app:app vibevoice/ ./vibevoice/
-COPY --chown=app:app speak.py ./
-COPY --chown=app:app requirements.txt ./
+COPY --chown=app:app speak.py ./ 
+COPY --chown=app:app requirements.txt ./ 
 
 # Create models directory with proper permissions
 RUN mkdir -p ./models
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1 
 
 # Expose port
 EXPOSE 8000
