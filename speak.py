@@ -56,16 +56,10 @@ app = FastAPI(
 )
 
 # Add CORS middleware
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://localhost:64011",
-    "https://your-frontend-app.com",
-]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins="*",
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -472,6 +466,13 @@ def audio_to_bytes(audio: np.ndarray) -> bytes:
     """Audio conversion to bytes."""
     postprocess_start = time.time()
     
+    # Handle torch tensors
+    if isinstance(audio, torch.Tensor):
+        if audio.dtype == torch.bfloat16:
+            audio = audio.to(torch.float32).cpu().numpy()
+        else:
+            audio = audio.cpu().numpy()
+    
     # Vectorized operations
     if audio.ndim > 1:
         audio = np.squeeze(audio)
@@ -501,7 +502,11 @@ def audio_chunk_to_bytes(audio_chunk: torch.Tensor) -> bytes:
     """Convert a single audio chunk to bytes for streaming."""
     # Convert tensor to numpy
     if isinstance(audio_chunk, torch.Tensor):
-        audio = audio_chunk.detach().cpu().numpy()
+        # Convert bfloat16 to float32 first, then to numpy
+        if audio_chunk.dtype == torch.bfloat16:
+            audio = audio_chunk.detach().cpu().to(torch.float32).numpy()
+        else:
+            audio = audio_chunk.detach().cpu().numpy()
     else:
         audio = audio_chunk
     
