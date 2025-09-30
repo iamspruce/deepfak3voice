@@ -9,7 +9,6 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
-      # Keep this first: Expands workspace without overwriting files (since empty pre-checkout)
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
@@ -21,7 +20,26 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
 
-      # NEW: Debug disk usage after maximization (remove once fixed)
+      - name: Free up additional disk space
+        run: |
+          echo "Freeing extra space on root..."
+          # Aggressive root tool removals (builds on maximize-build-space)
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /usr/local/lib/node_modules
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"  # GitHub agent tools dir
+          # Clear all major caches/temps
+          sudo rm -rf /tmp/* /var/tmp/* /var/cache/apt/archives/* ~/.cache/*
+          sudo apt-get clean && sudo apt-get autoclean
+          # Docker-specific root frees (safe even if no Docker yet)
+          sudo rm -rf /var/lib/docker/* /var/lib/buildkit/* || true
+          docker system prune -af --volumes || true  # Prune if Docker is partially initialized
+          # Extra: Compress and remove old logs if any
+          sudo find /home/runner -name "*.log" -type f -mtime +1 -delete || true
+          sudo journalctl --vacuum-time=1d || true  # If systemd logs are bloating
+          echo "Disk space after extra cleanup:"
+          df -h
+          echo "Top root consumers:"
+          sudo du -sh /* | sort -hr | head -n 10  # Focus on root subdirs
+
       - name: Check initial disk usage
         run: |
           echo "Disk usage after maximization:"
