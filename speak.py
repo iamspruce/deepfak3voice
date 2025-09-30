@@ -579,9 +579,8 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
         inference_start = time.time()
         
         with torch.inference_mode():
-            # Use autocast for mixed precision if available
             if str(device) == "cuda" and torch.cuda.is_available():
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     generated_audio = model.generate(
                         **inputs,
                         max_new_tokens=None,
