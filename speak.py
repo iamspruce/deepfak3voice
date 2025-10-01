@@ -502,6 +502,10 @@ def audio_chunk_to_bytes(audio_chunk: torch.Tensor) -> bytes:
     """Convert a single audio chunk to bytes for streaming."""
     # Convert tensor to numpy
     if isinstance(audio_chunk, torch.Tensor):
+        # REMOVE THE BATCH DIMENSION - Add this line
+        if audio_chunk.ndim > 1:
+            audio_chunk = audio_chunk.squeeze(0)  # Remove batch dimension [1, 3200] -> [3200]
+        
         # Convert bfloat16 to float32 first, then to numpy
         if audio_chunk.dtype == torch.bfloat16:
             audio = audio_chunk.detach().cpu().to(torch.float32).numpy()
@@ -1045,16 +1049,15 @@ async def single_speaker_tts_stream(
         async def stream_generator():
             try:
                 async for chunk_data in generate_streaming_audio(text, [voice_sample]):
-                    # Format as standard SSE
+                    # Format as standard SSE - send as string, not dict
                     event_type = chunk_data.pop("type", "message")
-                    sse_message = f"event: {event_type}\ndata: {json.dumps(chunk_data)}\n\n"
-                    yield sse_message
+                    
+                    # Manually format SSE message
+                    yield f"event: {event_type}\ndata: {json.dumps(chunk_data)}\n\n"
+                    
             except Exception as e:
                 logger.error(f"Stream error: {e}")
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"message": str(e)})
-                }
+                yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
         
         return EventSourceResponse(
             stream_generator(),
