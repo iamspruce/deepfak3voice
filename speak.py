@@ -293,7 +293,7 @@ def warmup_model():
     try:
         # Create dummy audio and text
         dummy_audio = np.random.randn(SAMPLE_RATE * 3).astype(np.float32)  # 3 seconds
-        dummy_text = "Speaker 1: This is a warmup text to optimize the model performance."
+        dummy_text = "Speaker 1: This is a warmup text."
         
         for i in range(WARMUP_ITERATIONS):
             logger.info(f"Warmup iteration {i+1}/{WARMUP_ITERATIONS}")
@@ -1049,15 +1049,18 @@ async def single_speaker_tts_stream(
         async def stream_generator():
             try:
                 async for chunk_data in generate_streaming_audio(text, [voice_sample]):
-                    # Format as standard SSE - send as string, not dict
-                    event_type = chunk_data.pop("type", "message")
-                    
-                    # Manually format SSE message
-                    yield f"event: {event_type}\ndata: {json.dumps(chunk_data)}\n\n"
+                    # Yield a dictionary and let EventSourceResponse handle formatting
+                    yield {
+                        "event": chunk_data.pop("type", "message"),
+                        "data": json.dumps(chunk_data)
+                    }
                     
             except Exception as e:
                 logger.error(f"Stream error: {e}")
-                yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+                yield {
+                    "event": "error",
+                    "data": json.dumps({'message': str(e)})
+                }
         
         return EventSourceResponse(
             stream_generator(),
@@ -1116,6 +1119,7 @@ async def multi_speaker_tts_stream(
                     "event": chunk_data["type"],
                     "data": json.dumps(chunk_data)
                 }
+                
         
         return EventSourceResponse(stream_generator(), media_type="text/event-stream")
         
