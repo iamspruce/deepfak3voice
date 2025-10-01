@@ -745,6 +745,9 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             async for audio_chunk in audio_streamer.get_stream(0):
                 chunk_count += 1
                 
+                print(f"Chunk {chunk_count}: shape={audio_chunk.shape if hasattr(audio_chunk, 'shape') else len(audio_chunk)}, min={audio_chunk.min()}, max={audio_chunk.max()}")
+    
+                
                 # Convert audio chunk to bytes
                 audio_bytes = audio_chunk_to_bytes(audio_chunk)
                 
@@ -1044,10 +1047,8 @@ async def single_speaker_tts_stream(
                 async for chunk_data in generate_streaming_audio(text, [voice_sample]):
                     # Format as standard SSE
                     event_type = chunk_data.pop("type", "message")
-                    yield {
-                        "event": event_type,
-                        "data": json.dumps(chunk_data)
-                    }
+                    sse_message = f"event: {event_type}\ndata: {json.dumps(chunk_data)}\n\n"
+                    yield sse_message
             except Exception as e:
                 logger.error(f"Stream error: {e}")
                 yield {
