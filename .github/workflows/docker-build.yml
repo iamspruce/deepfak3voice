@@ -12,8 +12,8 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 30720 # Reserve 30GB for build
-          swap-size-mb: 4096 # Increase swap
+          root-reserve-mb: 30720
+          swap-size-mb: 4096
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -25,12 +25,10 @@ jobs:
           echo "=== Initial disk usage ==="
           df -h
 
-          # Remove unnecessary packages and caches
           sudo apt-get clean
           sudo apt-get autoclean
           sudo apt-get autoremove -y
 
-          # Remove large directories not needed for Docker builds
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
@@ -38,13 +36,11 @@ jobs:
           sudo rm -rf /usr/local/lib/node_modules
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-          # Clear temp and cache directories
           sudo rm -rf /tmp/*
           sudo rm -rf /var/tmp/*
           sudo rm -rf /var/cache/apt/archives/*
           sudo rm -rf ~/.cache/*
 
-          # Remove old logs
           sudo journalctl --vacuum-time=1d 2>/dev/null || true
           sudo find /var/log -type f -name "*.log" -delete 2>/dev/null || true
 
@@ -63,7 +59,6 @@ jobs:
 
       - name: Configure Docker daemon for space optimization
         run: |
-          # Configure Docker to use minimal space
           sudo mkdir -p /etc/docker
           echo '{
             "storage-driver": "overlay2",
@@ -87,19 +82,19 @@ jobs:
           tags: spruceemma/vibevoice-server:${{ github.ref_name }},spruceemma/vibevoice-server:latest
           platforms: linux/amd64
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # Optimize build
+          # Remove cache-to to save disk space
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-          provenance: false # Reduce manifest size
-          sbom: false # Disable SBOM generation to save space
+          provenance: false
+          sbom: false
 
-      - name: Post-build cleanup
+      - name: Immediate cleanup after push
         if: always()
         run: |
           echo "=== Cleaning up Docker resources ==="
-          docker system prune -af --volumes
-          docker builder prune -af
+          # Clean up build cache and containers immediately
+          docker buildx prune -af || true
+          docker system prune -af --volumes || true
 
           echo "=== Final disk usage ==="
-          df -h
+          df -h || true

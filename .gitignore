@@ -17,3 +17,8 @@ __pycache__
 /vibevoice/modular/modeling_vibevoice_diffusion.pyc
 /vibevoice/modular/modeling_vibevoice_diffusion_inference.pyc   
 /models
+/transformers_cache
+/torch_cache
+/huggingface_cache
+speak-colab.ipynb
+speak-kaggle.ipynb

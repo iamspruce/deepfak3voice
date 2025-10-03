@@ -36,7 +36,3 @@ sse-starlette
 # Development and utilities
 python-dotenv>=1.0.0
 pillow>=10.0.0
-
-# Optional: For enhanced audio processing
-# pyaudio>=0.2.11  # Uncomment if you need real-time audio
-# webrtcvad>=2.0.10  # Uncomment for voice activity detection

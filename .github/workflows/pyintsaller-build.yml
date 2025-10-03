@@ -1,0 +1,587 @@
+name: Build Executables with PyInstaller
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: vibevoice-windows-amd64
+            exe_name: vibevoice-server.exe
+          - os: macos-latest
+            artifact_name: vibevoice-macos-arm64
+            exe_name: vibevoice-server
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg sox portaudio
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg sox -y
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Create PyInstaller spec file
+        shell: bash
+        run: |
+          cat > vibevoice-server.spec << 'SPECEOF'
+          # -*- mode: python ; coding: utf-8 -*-
+          import os
+          import sys
+          from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+          block_cipher = None
+
+          # Initialize collections
+          datas = []
+          hiddenimports = []
+          binaries = []
+
+          # Packages that need complete collection
+          packages = [
+              'fastapi',
+              'uvicorn',
+              'starlette',
+              'pydantic',
+              'pydantic_core',
+              'transformers',
+              'diffusers',
+              'huggingface_hub',
+              'tokenizers',
+              'librosa',
+              'soundfile',
+              'noisereduce',
+              'scipy',
+              'numpy',
+              'pandas',
+              'aiofiles',
+              'sse_starlette',
+          ]
+
+          print("Collecting packages...")
+          for pkg in packages:
+              try:
+                  pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
+                  datas += pkg_datas
+                  binaries += pkg_binaries
+                  hiddenimports += pkg_hiddenimports
+                  print(f"  ✓ {pkg}")
+              except Exception as e:
+                  print(f"  ⚠ {pkg}: {e}")
+
+          # Collect vibevoice module
+          print("Collecting vibevoice module...")
+          hiddenimports += collect_submodules('vibevoice')
+
+          # Critical hidden imports for FastAPI/Uvicorn
+          hiddenimports += [
+              'uvicorn.logging',
+              'uvicorn.loops',
+              'uvicorn.loops.auto',
+              'uvicorn.protocols',
+              'uvicorn.protocols.http',
+              'uvicorn.protocols.http.auto',
+              'uvicorn.protocols.http.h11_impl',
+              'uvicorn.protocols.http.httptools_impl',
+              'uvicorn.protocols.websockets',
+              'uvicorn.protocols.websockets.auto',
+              'uvicorn.protocols.websockets.wsproto_impl',
+              'uvicorn.lifespan',
+              'uvicorn.lifespan.on',
+              'anyio',
+              'sniffio',
+              'h11',
+              'httptools',
+              'websockets',
+              'multipart',
+              'email.mime',
+              'email.mime.multipart',
+              'email.mime.text',
+              'email.mime.base',
+          ]
+
+          # PyTorch specific
+          hiddenimports += [
+              'torch',
+              'torch.nn',
+              'torch.nn.functional',
+              'torchaudio',
+              'torchaudio.transforms',
+              'torchaudio.functional',
+              'torch._C',
+              'torch._dynamo',
+          ]
+
+          # Audio processing
+          hiddenimports += [
+              'librosa.core',
+              'librosa.feature',
+              'librosa.filters',
+              'scipy.signal',
+              'scipy.fft',
+              'scipy.special',
+              'soundfile',
+              'numpy.core',
+              'numpy.fft',
+          ]
+
+          # Add application files
+          if os.path.exists('vibevoice'):
+              datas.append(('vibevoice', 'vibevoice'))
+          if os.path.exists('speak.py'):
+              datas.append(('speak.py', '.'))
+          if os.path.exists('requirements.txt'):
+              datas.append(('requirements.txt', '.'))
+
+          # Exclude unnecessary packages
+          excludes = [
+              'matplotlib',
+              'tkinter',
+              'pytest',
+              'IPython',
+              'jupyter',
+              'notebook',
+              'sphinx',
+              'setuptools._distutils',
+          ]
+
+          a = Analysis(
+              ['speak.py'],
+              pathex=[],
+              binaries=binaries,
+              datas=datas,
+              hiddenimports=hiddenimports,
+              hookspath=[],
+              hooksconfig={},
+              runtime_hooks=[],
+              excludes=excludes,
+              win_no_prefer_redirects=False,
+              win_private_assemblies=False,
+              cipher=block_cipher,
+              noarchive=False,
+          )
+
+          pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+          exe = EXE(
+              pyz,
+              a.scripts,
+              a.binaries,
+              a.zipfiles,
+              a.datas,
+              [],
+              name='vibevoice-server',
+              debug=False,
+              bootloader_ignore_signals=False,
+              strip=False,
+              upx=True,
+              upx_exclude=[],
+              runtime_tmpdir=None,
+              console=True,
+              disable_windowed_traceback=False,
+              argv_emulation=False,
+              target_arch=None,
+              codesign_identity=None,
+              entitlements_file=None,
+          )
+          SPECEOF
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller vibevoice-server.spec --clean --noconfirm
+
+      - name: Verify build
+        shell: bash
+        run: |
+          echo "Build artifacts:"
+          ls -lh dist/
+
+      - name: Test executable (Quick check)
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            timeout 10 ./vibevoice-server.exe --help || echo "Quick test completed"
+          else
+            chmod +x vibevoice-server
+            timeout 10 ./vibevoice-server --help || echo "Quick test completed"
+          fi
+
+      - name: Create distribution package
+        shell: bash
+        run: |
+          # Create distribution directory
+          mkdir -p package
+
+          # Copy executable
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp dist/vibevoice-server.exe package/
+          else
+            cp dist/vibevoice-server package/
+            chmod +x package/vibevoice-server
+          fi
+
+          # Create models directory
+          mkdir -p package/models
+
+          # Create .env template
+          cat > package/.env.example << 'EOF'
+          # VibeVoice Configuration
+
+          # Server settings
+          HOST=0.0.0.0
+          PORT=8000
+          WORKERS=1
+
+          # Model settings
+          MODEL_CACHE_DIR=./models
+          HF_HOME=./models
+
+          # CUDA settings (if using GPU)
+          CUDA_VISIBLE_DEVICES=0
+
+          # Optional: Hugging Face token for private models
+          # HF_TOKEN=your_token_here
+          EOF
+
+          # Create comprehensive README
+          cat > package/README.md << 'EOF'
+          # VibeVoice Server - Standalone Edition
+
+          ## 📋 System Requirements
+
+          ### Required Software
+          - **FFmpeg**: Audio/video processing
+          - **SoX**: Sound processing
+          - **CUDA 12.1+**: For GPU acceleration (optional but recommended)
+
+          ### Hardware Requirements
+          - **RAM**: Minimum 8GB, 16GB+ recommended
+          - **Storage**: 5GB+ free space (for models)
+          - **GPU**: NVIDIA GPU with 4GB+ VRAM (optional, CPU works too)
+
+          ## 🔧 Installation
+
+          ### Windows
+
+          1. **Install FFmpeg**:
+             - Download from: https://ffmpeg.org/download.html
+             - Extract and add to PATH
+             - Verify: `ffmpeg -version`
+
+          2. **Install SoX**:
+             - Download from: https://sourceforge.net/projects/sox/
+             - Install and add to PATH
+             - Verify: `sox --version`
+
+          3. **Install CUDA** (for GPU):
+             - Download CUDA 12.1+: https://developer.nvidia.com/cuda-downloads
+             - Verify: `nvidia-smi`
+
+          ### macOS
+
+          ```bash
+          # Install dependencies via Homebrew
+          brew install ffmpeg sox
+
+          # Verify installations
+          ffmpeg -version
+          sox --version
+          ```
+
+          ## 🚀 Usage
+
+          ### Basic Usage
+
+          ```bash
+          # Windows
+          vibevoice-server.exe
+
+          # macOS/Linux
+          ./vibevoice-server
+          ```
+
+          The server will start on `http://localhost:8000`
+
+          ### Custom Configuration
+
+          ```bash
+          # Custom host and port
+          ./vibevoice-server --host 0.0.0.0 --port 8080
+
+          # Multiple workers (not recommended for GPU)
+          ./vibevoice-server --workers 2
+
+          # With environment variables
+          HOST=0.0.0.0 PORT=8080 ./vibevoice-server
+          ```
+
+          ### Environment Variables
+
+          Copy `.env.example` to `.env` and customize:
+
+          ```bash
+          cp .env.example .env
+          ```
+
+          ## 📚 API Documentation
+
+          Once running, visit:
+          - **Swagger UI**: http://localhost:8000/docs
+          - **ReDoc**: http://localhost:8000/redoc
+          - **Health Check**: http://localhost:8000/health
+
+          ## 🗂️ Directory Structure
+
+          ```
+          vibevoice-server/
+          ├── vibevoice-server(.exe)  # Main executable
+          ├── models/                  # Model cache (created automatically)
+          ├── .env.example            # Configuration template
+          └── README.md               # This file
+          ```
+
+          ## ⚠️ Troubleshooting
+
+          ### "FFmpeg not found"
+          ```bash
+          # Verify FFmpeg is in PATH
+          ffmpeg -version
+
+          # Windows: Add to system PATH in Environment Variables
+          # macOS: Reinstall with brew install ffmpeg
+          ```
+
+          ### "SoX not found"
+          ```bash
+          # Verify SoX is in PATH
+          sox --version
+          ```
+
+          ### "No CUDA GPUs available"
+          - Ensure NVIDIA drivers are up to date
+          - Verify CUDA installation: `nvidia-smi`
+          - Check CUDA version matches (12.1+)
+          - CPU mode works but is slower
+
+          ### "Failed to load model"
+          - Ensure stable internet connection
+          - Models are ~1-2GB and download on first use
+          - Check disk space in `models/` directory
+
+          ### Out of Memory
+          - Reduce batch size in requests
+          - Use CPU mode if GPU has insufficient VRAM
+          - Close other applications
+
+          ### Import Errors
+          Some dependencies may not bundle perfectly. If you encounter issues:
+          1. Check the error message for missing modules
+          2. Consider using the Docker version
+          3. Report issues on GitHub
+
+          ## 🐳 Docker Alternative (Recommended)
+
+          For production use, Docker is more reliable:
+
+          ```bash
+          docker pull spruceemma/vibevoice-server:latest
+          docker run -p 8000:8000 --gpus all spruceemma/vibevoice-server:latest
+          ```
+
+          ## 📊 Performance Notes
+
+          - **First run**: Slower due to model downloads (~1-2GB)
+          - **GPU mode**: Significantly faster (10-50x vs CPU)
+          - **CPU mode**: Works but slower, uses more RAM
+          - **Model caching**: Subsequent runs are faster
+
+          ## 🔒 Security Notes
+
+          - Don't expose directly to internet without proper security
+          - Use reverse proxy (nginx, caddy) for production
+          - Enable authentication if exposing externally
+          - Keep the executable and dependencies updated
+
+          ## 📝 License & Support
+
+          - Check the main repository for license information
+          - Report issues: [GitHub Issues](https://github.com/spruceemma/vibevoice)
+          - Documentation: Check API docs at `/docs`
+
+          ## 🆘 Getting Help
+
+          If you encounter issues:
+          1. Check this README's troubleshooting section
+          2. Verify all dependencies are installed
+          3. Check GitHub issues for similar problems
+          4. Create a new issue with detailed error messages
+
+          ---
+
+          **Note**: This standalone executable is experimental. For production environments,
+          the Docker version is recommended for better reliability and easier deployment.
+          EOF
+
+          echo "Package contents:"
+          ls -lah package/
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd package
+          7z a -tzip ../${{ matrix.artifact_name }}.zip *
+          cd ..
+          ls -lh ${{ matrix.artifact_name }}.zip
+
+      - name: Create archive (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd package
+          tar -czf ../${{ matrix.artifact_name }}.tar.gz *
+          cd ..
+          ls -lh ${{ matrix.artifact_name }}.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.zip
+            ${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: |
+          echo "Downloaded artifacts:"
+          ls -R artifacts/
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release_files
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release_files/ \;
+          echo "Release files:"
+          ls -lh release_files/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release_files/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            # 🎙️ VibeVoice Server v${{ github.ref_name }}
+
+            ## 📦 Standalone Executables
+
+            Download the appropriate version for your system:
+
+            - **Windows (x64)**: `vibevoice-windows-amd64.zip`
+            - **macOS (ARM64)**: `vibevoice-macos-arm64.tar.gz`
+
+            ## ⚠️ Important Notes
+
+            ### System Requirements
+            - **FFmpeg** and **SoX** must be installed separately
+            - **CUDA 12.1+** required for GPU acceleration
+            - **8GB+ RAM** recommended
+            - **5GB+ storage** for models
+
+            ### First Run
+            - Models (~1-2GB) will download automatically
+            - First inference will be slower
+            - Ensure stable internet connection
+
+            ### Quick Start
+
+            **Windows**:
+            ```cmd
+            # Extract the zip
+            # Run the executable
+            vibevoice-server.exe
+            ```
+
+            **macOS**:
+            ```bash
+            # Extract the archive
+            tar -xzf vibevoice-macos-arm64.tar.gz
+
+            # Run the server
+            ./vibevoice-server
+            ```
+
+            Visit http://localhost:8000/docs for API documentation.
+
+            ## 🐳 Docker (Recommended)
+
+            For production use, Docker provides better reliability:
+
+            ```bash
+            docker pull spruceemma/vibevoice-server:${{ github.ref_name }}
+            docker run -p 8000:8000 --gpus all spruceemma/vibevoice-server:${{ github.ref_name }}
+            ```
+
+            ## 📋 What's New
+
+            See full changelog below.
+
+            ## 🐛 Known Issues
+
+            - Large executable size (2-5GB) due to PyTorch bundling
+            - Some systems may require additional runtime libraries
+            - GPU support may vary by system configuration
+
+            ## 📝 Documentation
+
+            - **API Docs**: http://localhost:8000/docs
+            - **README**: Included in download
+            - **Issues**: https://github.com/spruceemma/vibevoice/issues
+
+            ---
+
+            **Note**: These executables are experimental. For production environments,
+            we recommend using the Docker image for better stability and easier deployment.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

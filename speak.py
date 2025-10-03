@@ -8,12 +8,13 @@ from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 import traceback
 import asyncio
-
+import requests
+from datetime import datetime, timedelta
 import torch
 import numpy as np
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,7 +28,6 @@ import json
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-from vibevoice.modular.streamer import AudioStreamer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +48,11 @@ MIN_VRAM_FOR_7B = 18
 # Performance optimizations
 WARMUP_ITERATIONS = 3
 AUDIO_CACHE_SIZE = 100
+
+# License verification
+GUMROAD_PRODUCT_ID = "your_product_id_here"
+LICENSE_GRACE_PERIOD = 86400  # 24 hours in seconds
+license_cache = {}  # {license_key: {valid: bool, last_check: timestamp, purchase_info: dict}}
 
 app = FastAPI(
     title="VibeVoice Inference Server",
@@ -830,10 +835,35 @@ async def root():
     }
 
 @app.get("/health")
-async def health_check():
-    """Enhanced health check endpoint."""
+async def health_check(license_key: str = None):
+    """Enhanced health check endpoint with license verification."""
+    
+    # Check license if provided
+    license_status = None
+    if license_key:
+        cached_status = check_license_validity(license_key)
+        
+        if cached_status["needs_verification"]:
+            # Perform fresh verification
+            license_status = await verify_and_cache_license(license_key)
+        else:
+            license_status = cached_status
+        
+        # If license is invalid, return error
+        if not license_status["valid"]:
+            return {
+                "status": "unauthorized",
+                "error": "Invalid or expired license",
+                "license_status": license_status["status"],
+                "message": license_status["message"],
+                "model_loaded": False,
+                "warmup_complete": False
+            }
+    
+    # Get system info
     system_info = get_system_info()
-    return {
+    
+    response = {
         "status": "healthy" if system_info.model_loaded and warmup_complete else "warming_up" if system_info.model_loaded else "model_not_loaded",
         "gpu_available": system_info.gpu_available,
         "model_loaded": system_info.model_loaded,
@@ -844,7 +874,38 @@ async def health_check():
         "cpu_usage": system_info.cpu_usage,
         "ram_usage_percent": (system_info.ram_used / system_info.ram_total) * 100
     }
+    
+    # Add license status if checked
+    if license_status:
+        response["license_status"] = license_status["status"]
+        response["license_valid"] = license_status["valid"]
+        if "time_until_recheck" in license_status:
+            response["license_recheck_in_hours"] = license_status["time_until_recheck"] / 3600
+    
+    return response
 
+@app.post("/verify-license")
+async def verify_license_endpoint(license_key: str = Form(...)):
+    """
+    Verify license key for initial setup.
+    """
+    if not license_key or not license_key.strip():
+        raise HTTPException(status_code=400, detail="License key is required")
+    
+    result = await verify_and_cache_license(license_key)
+    
+    if not result["valid"]:
+        raise HTTPException(
+            status_code=403, 
+            detail=result["message"]
+        )
+    
+    return {
+        "valid": result["valid"],
+        "status": result["status"],
+        "message": result["message"]
+    }
+    
 @app.get("/system", response_model=SystemInfo)
 async def get_system_info_endpoint():
     """Get comprehensive system information."""
@@ -1049,7 +1110,7 @@ async def single_speaker_tts_stream(
         async def stream_generator():
             try:
                 async for chunk_data in generate_streaming_audio(text, [voice_sample]):
-                    # Yield a dictionary and let EventSourceResponse handle formatting
+                    
                     yield {
                         "event": chunk_data.pop("type", "message"),
                         "data": json.dumps(chunk_data)
@@ -1154,6 +1215,158 @@ async def reload_model():
     except Exception as e:
         logger.error(f"Failed to reload model: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload model: {str(e)}")
+
+async def verify_gumroad_license(license_key: str, product_id: str = GUMROAD_PRODUCT_ID) -> dict:
+    """
+    Verify license key with Gumroad API.
+    Returns: {success: bool, valid: bool, purchase: dict, message: str}
+    """
+    try:
+        logger.info(f"Verifying license key with Gumroad API...")
+        
+        response = requests.post(
+            "https://api.gumroad.com/v2/licenses/verify",
+            data={
+                "product_id": product_id,
+                "license_key": license_key,
+            },
+            timeout=10
+        )
+        
+        data = response.json()
+        
+        if response.status_code == 200 and data.get("success"):
+            return {
+                "success": True,
+                "valid": True,
+                "purchase": data.get("purchase", {}),
+                "uses": data.get("uses", 0),
+                "message": "License is valid"
+            }
+        else:
+            return {
+                "success": True,
+                "valid": False,
+                "message": data.get("message", "Invalid license key")
+            }
+            
+    except requests.exceptions.Timeout:
+        logger.error("Gumroad API timeout")
+        return {
+            "success": False,
+            "valid": False,
+            "message": "Verification timeout - using grace period if available"
+        }
+    except Exception as e:
+        logger.error(f"License verification failed: {e}")
+        return {
+            "success": False,
+            "valid": False,
+            "message": f"Verification error: {str(e)}"
+        }
+
+def check_license_validity(license_key: str) -> dict:
+    """
+    Check if license is valid with 24h grace period.
+    Returns: {valid: bool, status: str, message: str, needs_verification: bool}
+    """
+    if not license_key or not license_key.strip():
+        return {
+            "valid": False,
+            "status": "invalid",
+            "message": "No license key provided",
+            "needs_verification": True
+        }
+    
+    # Check cache
+    cached = license_cache.get(license_key)
+    
+    if cached:
+        time_since_check = time.time() - cached['last_check']
+        
+        # If within grace period
+        if time_since_check < LICENSE_GRACE_PERIOD:
+            if cached['valid']:
+                return {
+                    "valid": True,
+                    "status": "valid",
+                    "message": "License is valid (cached)",
+                    "needs_verification": False,
+                    "last_check": cached['last_check'],
+                    "time_until_recheck": LICENSE_GRACE_PERIOD - time_since_check
+                }
+            else:
+                # Was invalid within grace period
+                return {
+                    "valid": False,
+                    "status": "invalid",
+                    "message": "License key is invalid",
+                    "needs_verification": False
+                }
+        else:
+            # Grace period expired, need fresh verification
+            if cached['valid']:
+                # Allow use during verification (grace period extension)
+                return {
+                    "valid": True,
+                    "status": "grace_period",
+                    "message": "Grace period active - verification needed",
+                    "needs_verification": True
+                }
+            else:
+                return {
+                    "valid": False,
+                    "status": "expired",
+                    "message": "License verification expired",
+                    "needs_verification": True
+                }
+    
+    # No cache entry
+    return {
+        "valid": False,
+        "status": "unverified",
+        "message": "License not yet verified",
+        "needs_verification": True
+    }
+
+async def verify_and_cache_license(license_key: str) -> dict:
+    """
+    Verify license with Gumroad and update cache.
+    Returns: {valid: bool, status: str, message: str}
+    """
+    result = await verify_gumroad_license(license_key)
+    
+    if result["success"]:
+        # Update cache
+        license_cache[license_key] = {
+            "valid": result["valid"],
+            "last_check": time.time(),
+            "purchase_info": result.get("purchase", {})
+        }
+        
+        return {
+            "valid": result["valid"],
+            "status": "valid" if result["valid"] else "invalid",
+            "message": result["message"]
+        }
+    else:
+        # Verification failed (network error, etc)
+        # Check if we have cached data
+        cached_status = check_license_validity(license_key)
+        
+        if cached_status["valid"]:
+            # Use grace period
+            return {
+                "valid": True,
+                "status": "grace_period",
+                "message": "Using cached validation due to verification error"
+            }
+        else:
+            return {
+                "valid": False,
+                "status": "error",
+                "message": result["message"]
+            }
 
 if __name__ == "__main__":
     import uvicorn
