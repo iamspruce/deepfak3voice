@@ -20,6 +20,8 @@ jobs:
             exe_name: vibevoice-server
 
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: 1
 
     steps:
       - name: Checkout code
