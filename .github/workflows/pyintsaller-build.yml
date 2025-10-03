@@ -34,12 +34,12 @@ jobs:
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ffmpeg sox portaudio
+          brew install ffmpeg portaudio
 
       - name: Install system dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          choco install ffmpeg sox -y
+          choco install ffmpeg -y
 
       - name: Install Python dependencies
         run: |
