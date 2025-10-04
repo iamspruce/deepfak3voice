@@ -488,6 +488,9 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
 
+    permissions:
+      contents: write
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -526,7 +529,7 @@ jobs:
             ## ⚠️ Important Notes
 
             ### System Requirements
-            - **FFmpeg** and **SoX** must be installed separately
+            - **FFmpeg** must be installed separately
             - **CUDA 12.1+** required for GPU acceleration
             - **8GB+ RAM** recommended
             - **5GB+ storage** for models
