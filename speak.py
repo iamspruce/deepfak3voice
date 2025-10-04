@@ -50,7 +50,7 @@ WARMUP_ITERATIONS = 3
 AUDIO_CACHE_SIZE = 100
 
 # License verification
-GUMROAD_PRODUCT_ID = "your_product_id_here"
+GUMROAD_PRODUCT_ID = "Apv6fptxqEqWgANZQAtsfQ=="
 LICENSE_GRACE_PERIOD = 86400  # 24 hours in seconds
 license_cache = {}  # {license_key: {valid: bool, last_check: timestamp, purchase_info: dict}}
 
