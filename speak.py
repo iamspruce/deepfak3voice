@@ -757,18 +757,16 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         # Stream audio chunks as they become available
         try:
             async for audio_chunk in audio_streamer.get_stream(0):
-                # ### FIX START ###
-                # Convert the bfloat16 tensor to a float32 numpy array immediately.
                 numpy_chunk = audio_chunk.to(torch.float32).cpu().numpy()
                 
                 # Accumulate the numpy arrays instead of tensors.
                 accumulated_audio.append(numpy_chunk)
-                accumulated_samples += len(numpy_chunk)
+                accumulated_samples += numpy_chunk.size
                 # ### FIX END ###
                 
                 # Only send when we have enough samples
                 if accumulated_samples >= CHUNK_ACCUMULATION_SIZE:
-                    # Concatenate accumulated chunks (now they are all numpy arrays)
+                    # Combine accumulated chunks
                     combined_chunk = np.concatenate(accumulated_audio)
                     chunk_count += 1
                     
@@ -1215,7 +1213,7 @@ async def multi_speaker_tts_stream(
         async def stream_generator():
             async for chunk_data in generate_streaming_audio(text, voice_samples):
                 yield {
-                    "event": chunk_data["type"],
+                    "event": chunk_data.pop("type", "message"),
                     "data": json.dumps(chunk_data)
                 }
                 
