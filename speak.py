@@ -747,30 +747,63 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             asyncio.to_thread(run_generation)
         )
         
-        # Stream audio chunks as they become available
+        # Chunk accumulation configuration
+        CHUNK_ACCUMULATION_SIZE = 4800  # ~200ms at 24kHz
+        accumulated_audio = []
+        accumulated_samples = 0
         chunk_count = 0
+        
+        # Stream audio chunks as they become available
         try:
-            # Use async iteration with AsyncAudioStreamer
             async for audio_chunk in audio_streamer.get_stream(0):
+                # Accumulate chunks
+                accumulated_audio.append(audio_chunk)
+                accumulated_samples += len(audio_chunk)
+                
+                # Only send when we have enough samples
+                if accumulated_samples >= CHUNK_ACCUMULATION_SIZE:
+                    # Concatenate accumulated chunks
+                    combined_chunk = np.concatenate(accumulated_audio)
+                    chunk_count += 1
+                    
+                    print(f"Chunk {chunk_count}: samples={len(combined_chunk)}, duration={len(combined_chunk)/SAMPLE_RATE*1000:.1f}ms, min={combined_chunk.min():.3f}, max={combined_chunk.max():.3f}")
+                    
+                    # Convert audio chunk to bytes
+                    audio_bytes = audio_chunk_to_bytes(combined_chunk)
+                    
+                    # Create the streaming data
+                    chunk_data = {
+                        "type": "audio_chunk",
+                        "chunk_id": chunk_count,
+                        "audio_data": audio_bytes.hex(),
+                        "sample_rate": SAMPLE_RATE,
+                        "duration_ms": len(combined_chunk) / SAMPLE_RATE * 1000,
+                        "timestamp": time.time()
+                    }
+                    
+                    yield chunk_data
+                    
+                    # Reset accumulator
+                    accumulated_audio = []
+                    accumulated_samples = 0
+            
+            # Send any remaining audio after stream ends
+            if accumulated_audio:
+                combined_chunk = np.concatenate(accumulated_audio)
                 chunk_count += 1
                 
-                print(f"Chunk {chunk_count}: shape={audio_chunk.shape if hasattr(audio_chunk, 'shape') else len(audio_chunk)}, min={audio_chunk.min()}, max={audio_chunk.max()}")
-    
+                print(f"Final chunk {chunk_count}: samples={len(combined_chunk)}, duration={len(combined_chunk)/SAMPLE_RATE*1000:.1f}ms")
                 
-                # Convert audio chunk to bytes
-                audio_bytes = audio_chunk_to_bytes(audio_chunk)
+                audio_bytes = audio_chunk_to_bytes(combined_chunk)
                 
-                # Create the streaming data
-                chunk_data = {
+                yield {
                     "type": "audio_chunk",
                     "chunk_id": chunk_count,
                     "audio_data": audio_bytes.hex(),
                     "sample_rate": SAMPLE_RATE,
-                    "duration_ms": len(audio_chunk) / SAMPLE_RATE * 1000,
+                    "duration_ms": len(combined_chunk) / SAMPLE_RATE * 1000,
                     "timestamp": time.time()
                 }
-                
-                yield chunk_data
         
         except Exception as e:
             logger.error(f"Error in streaming: {e}")
