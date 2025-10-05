@@ -30,6 +30,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Free up disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+
+          # Remove unnecessary tools and packages
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          # Clean apt cache
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          sudo apt-get autoclean -y
+
+          # Remove docker images
+          docker rmi $(docker image ls -aq) || true
+
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -57,6 +82,10 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install pyinstaller
           pip install -r requirements.txt
+
+      - name: Clean pip cache
+        run: |
+          pip cache purge
 
       - name: Create PyInstaller spec file
         shell: bash
@@ -223,9 +252,26 @@ jobs:
           )
           SPECEOF
 
+      - name: Check disk space before build
+        shell: bash
+        run: |
+          echo "Disk space before PyInstaller build:"
+          df -h
+
       - name: Build with PyInstaller
         run: |
           pyinstaller vibevoice-server.spec --clean --noconfirm
+
+      - name: Clean PyInstaller build artifacts
+        shell: bash
+        run: |
+          echo "Cleaning up PyInstaller temporary files..."
+          rm -rf build/
+          rm -rf __pycache__/
+          find . -type d -name "*.egg-info" -exec rm -rf {} + || true
+          find . -type d -name "__pycache__" -exec rm -rf {} + || true
+          echo "Disk space after cleanup:"
+          df -h
 
       - name: Verify build
         shell: bash
@@ -422,6 +468,14 @@ jobs:
           echo "Package contents:"
           ls -lah package/
 
+      - name: Clean dist directory before archiving
+        shell: bash
+        run: |
+          echo "Removing dist directory to save space..."
+          rm -rf dist/
+          echo "Disk space after removing dist:"
+          df -h
+
       - name: Create archive
         shell: bash
         run: |
@@ -435,6 +489,14 @@ jobs:
           cd ..
           echo "Created archive:"
           ls -lh ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+      - name: Clean package directory
+        shell: bash
+        run: |
+          echo "Removing package directory to save space..."
+          rm -rf package/
+          echo "Final disk space:"
+          df -h
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
