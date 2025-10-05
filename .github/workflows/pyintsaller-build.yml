@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libportaudio2
+          sudo apt-get install -y ffmpeg libportaudio2 binutils
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -210,7 +210,7 @@ jobs:
               name='vibevoice-server',
               debug=False,
               bootloader_ignore_signals=False,
-              strip=False,
+              strip=True,
               upx=True,
               upx_exclude=[],
               runtime_tmpdir=None,
