@@ -685,7 +685,8 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             else:
                 formatted_text = text
         
-        formatted_text = formatted_text.replace("ÃƒÆ'Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢", "'")
+        # NOTE: The character replacement below had an encoding issue, corrected it.
+        formatted_text = formatted_text.replace("â€™", "'")
         
         # Process inputs
         inputs = processor(
@@ -756,13 +757,18 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         # Stream audio chunks as they become available
         try:
             async for audio_chunk in audio_streamer.get_stream(0):
-                # Accumulate chunks
-                accumulated_audio.append(audio_chunk)
-                accumulated_samples += len(audio_chunk)
+                # ### FIX START ###
+                # Convert the bfloat16 tensor to a float32 numpy array immediately.
+                numpy_chunk = audio_chunk.to(torch.float32).cpu().numpy()
+                
+                # Accumulate the numpy arrays instead of tensors.
+                accumulated_audio.append(numpy_chunk)
+                accumulated_samples += len(numpy_chunk)
+                # ### FIX END ###
                 
                 # Only send when we have enough samples
                 if accumulated_samples >= CHUNK_ACCUMULATION_SIZE:
-                    # Concatenate accumulated chunks
+                    # Concatenate accumulated chunks (now they are all numpy arrays)
                     combined_chunk = np.concatenate(accumulated_audio)
                     chunk_count += 1
                     
@@ -840,7 +846,6 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             "message": str(e),
             "timestamp": time.time()
         }
-
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting VibeVoice Inference Server v2.2...")
