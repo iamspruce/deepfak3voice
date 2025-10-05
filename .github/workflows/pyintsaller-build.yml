@@ -10,14 +10,17 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
         include:
           - os: windows-latest
             artifact_name: vibevoice-windows-amd64
-            exe_name: vibevoice-server.exe
+            archive_ext: zip
           - os: macos-latest
             artifact_name: vibevoice-macos-arm64
-            exe_name: vibevoice-server
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            artifact_name: vibevoice-linux-amd64
+            archive_ext: tar.gz
 
     runs-on: ${{ matrix.os }}
     env:
@@ -32,6 +35,12 @@ jobs:
         with:
           python-version: "3.10"
           cache: "pip"
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libportaudio2
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -273,7 +282,7 @@ jobs:
           # HF_TOKEN=your_token_here
           EOF
 
-          # Create comprehensive README
+          # Create comprehensive README (Updated with Linux instructions)
           cat > package/README.md << 'EOF'
           # VibeVoice Server - Standalone Edition
 
@@ -281,7 +290,6 @@ jobs:
 
           ### Required Software
           - **FFmpeg**: Audio/video processing
-          - **SoX**: Sound processing
           - **CUDA 12.1+**: For GPU acceleration (optional but recommended)
 
           ### Hardware Requirements
@@ -298,10 +306,6 @@ jobs:
              - Extract and add to PATH
              - Verify: `ffmpeg -version`
 
-          2. **Install SoX**:
-             - Download from: https://sourceforge.net/projects/sox/
-             - Install and add to PATH
-             - Verify: `sox --version`
 
           3. **Install CUDA** (for GPU):
              - Download CUDA 12.1+: https://developer.nvidia.com/cuda-downloads
@@ -312,6 +316,18 @@ jobs:
           ```bash
           # Install dependencies via Homebrew
           brew install ffmpeg sox
+
+          # Verify installations
+          ffmpeg -version
+          sox --version
+          ```
+
+          ### Linux (Debian/Ubuntu)
+
+          ```bash
+          # Install dependencies via apt
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg sox
 
           # Verify installations
           ffmpeg -version
@@ -376,15 +392,6 @@ jobs:
           ```bash
           # Verify FFmpeg is in PATH
           ffmpeg -version
-
-          # Windows: Add to system PATH in Environment Variables
-          # macOS: Reinstall with brew install ffmpeg
-          ```
-
-          ### "SoX not found"
-          ```bash
-          # Verify SoX is in PATH
-          sox --version
           ```
 
           ### "No CUDA GPUs available"
@@ -403,12 +410,6 @@ jobs:
           - Use CPU mode if GPU has insufficient VRAM
           - Close other applications
 
-          ### Import Errors
-          Some dependencies may not bundle perfectly. If you encounter issues:
-          1. Check the error message for missing modules
-          2. Consider using the Docker version
-          3. Report issues on GitHub
-
           ## 🐳 Docker Alternative (Recommended)
 
           For production use, Docker is more reliable:
@@ -417,70 +418,30 @@ jobs:
           docker pull spruceemma/vibevoice-server:latest
           docker run -p 8000:8000 --gpus all spruceemma/vibevoice-server:latest
           ```
-
-          ## 📊 Performance Notes
-
-          - **First run**: Slower due to model downloads (~1-2GB)
-          - **GPU mode**: Significantly faster (10-50x vs CPU)
-          - **CPU mode**: Works but slower, uses more RAM
-          - **Model caching**: Subsequent runs are faster
-
-          ## 🔒 Security Notes
-
-          - Don't expose directly to internet without proper security
-          - Use reverse proxy (nginx, caddy) for production
-          - Enable authentication if exposing externally
-          - Keep the executable and dependencies updated
-
-          ## 📝 License & Support
-
-          - Check the main repository for license information
-          - Report issues: [GitHub Issues](https://github.com/spruceemma/vibevoice)
-          - Documentation: Check API docs at `/docs`
-
-          ## 🆘 Getting Help
-
-          If you encounter issues:
-          1. Check this README's troubleshooting section
-          2. Verify all dependencies are installed
-          3. Check GitHub issues for similar problems
-          4. Create a new issue with detailed error messages
-
-          ---
-
-          **Note**: This standalone executable is experimental. For production environments,
-          the Docker version is recommended for better reliability and easier deployment.
           EOF
 
           echo "Package contents:"
           ls -lah package/
 
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
+      # Simplified archive creation for all platforms
+      - name: Create archive
         shell: bash
         run: |
           cd package
-          7z a -tzip ../${{ matrix.artifact_name }}.zip *
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            7z a -tzip ../${{ matrix.artifact_name }}.zip *
+          else
+            tar -czf ../${{ matrix.artifact_name }}.tar.gz *
+          fi
           cd ..
-          ls -lh ${{ matrix.artifact_name }}.zip
-
-      - name: Create archive (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          cd package
-          tar -czf ../${{ matrix.artifact_name }}.tar.gz *
-          cd ..
-          ls -lh ${{ matrix.artifact_name }}.tar.gz
+          echo "Created archive:"
+          ls -lh *.{zip,tar.gz}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.artifact_name }}.zip
-            ${{ matrix.artifact_name }}.tar.gz
-          if-no-files-found: ignore
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
           retention-days: 30
 
   create-release:
@@ -516,6 +477,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          # Updated release body with Linux artifact
           body: |
             # 🎙️ VibeVoice Server v${{ github.ref_name }}
 
@@ -525,11 +487,12 @@ jobs:
 
             - **Windows (x64)**: `vibevoice-windows-amd64.zip`
             - **macOS (ARM64)**: `vibevoice-macos-arm64.tar.gz`
+            - **Linux (x64)**: `vibevoice-linux-amd64.tar.gz`
 
             ## ⚠️ Important Notes
 
             ### System Requirements
-            - **FFmpeg** must be installed separately
+            - **FFmpeg & SoX** must be installed separately
             - **CUDA 12.1+** required for GPU acceleration
             - **8GB+ RAM** recommended
             - **5GB+ storage** for models
@@ -548,10 +511,13 @@ jobs:
             vibevoice-server.exe
             ```
 
-            **macOS**:
+            **macOS / Linux**:
             ```bash
             # Extract the archive
-            tar -xzf vibevoice-macos-arm64.tar.gz
+            tar -xzf vibevoice-*.tar.gz
+
+            # Make it executable
+            chmod +x vibevoice-server
 
             # Run the server
             ./vibevoice-server
@@ -571,22 +537,5 @@ jobs:
             ## 📋 What's New
 
             See full changelog below.
-
-            ## 🐛 Known Issues
-
-            - Large executable size (2-5GB) due to PyTorch bundling
-            - Some systems may require additional runtime libraries
-            - GPU support may vary by system configuration
-
-            ## 📝 Documentation
-
-            - **API Docs**: http://localhost:8000/docs
-            - **README**: Included in download
-            - **Issues**: https://github.com/spruceemma/vibevoice/issues
-
-            ---
-
-            **Note**: These executables are experimental. For production environments,
-            we recommend using the Docker image for better stability and easier deployment.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
