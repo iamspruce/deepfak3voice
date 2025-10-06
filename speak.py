@@ -829,24 +829,36 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         logger.error(traceback.format_exc())
         yield {"type": "error", "message": str(e), "timestamp": time.time()}
 
+# in your server code
 def apply_crossfade(audio: np.ndarray, sample_rate: int, fade_ms: int = 10) -> np.ndarray:
     """Apply fade-in and fade-out to reduce clicks."""
+    # Check if the audio is 2D (multi-channel)
+    if audio.ndim == 1:
+        num_samples = len(audio)
+    else:
+        num_samples = audio.shape[1] # Get length from the time axis (columns)
+
     fade_samples = int(sample_rate * fade_ms / 1000)
-    fade_samples = min(fade_samples, len(audio) // 4)  # Max 25% of audio
-    
-    if len(audio) < fade_samples * 2:
+    fade_samples = min(fade_samples, num_samples // 4)
+
+    if num_samples < fade_samples * 2:
         return audio
-    
+
     # Create fade curves
     fade_in = np.linspace(0, 1, fade_samples)
     fade_out = np.linspace(1, 0, fade_samples)
-    
-    # Apply fades
-    audio[:fade_samples] *= fade_in
-    audio[-fade_samples:] *= fade_out
+
+    # Apply fades correctly to multi-channel audio
+    if audio.ndim == 1:
+        # Mono audio
+        audio[:fade_samples] *= fade_in
+        audio[-fade_samples:] *= fade_out
+    else:
+        # Multi-channel audio: apply fade to every channel
+        audio[:, :fade_samples] *= fade_in
+        audio[:, -fade_samples:] *= fade_out
     
     return audio
-
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting VibeVoice Inference Server v2.2...")
@@ -1223,6 +1235,7 @@ async def websocket_tts_stream(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
