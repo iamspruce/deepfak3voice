@@ -14,7 +14,8 @@ import torch
 import numpy as np
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, WebSocket, WebSocketDisconnect
+import base64
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -503,15 +504,11 @@ def audio_to_bytes(audio: np.ndarray) -> bytes:
     
     return byte_io.getvalue()
 
-def audio_chunk_to_bytes(audio_chunk: torch.Tensor) -> bytes:
-    """Convert a single audio chunk to bytes for streaming."""
-    # Convert tensor to numpy
+def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
+    """Convert audio chunk to bytes with dithering."""
     if isinstance(audio_chunk, torch.Tensor):
-        # REMOVE THE BATCH DIMENSION - Add this line
         if audio_chunk.ndim > 1:
-            audio_chunk = audio_chunk.squeeze(0)  # Remove batch dimension [1, 3200] -> [3200]
-        
-        # Convert bfloat16 to float32 first, then to numpy
+            audio_chunk = audio_chunk.squeeze(0)
         if audio_chunk.dtype == torch.bfloat16:
             audio = audio_chunk.detach().cpu().to(torch.float32).numpy()
         else:
@@ -519,12 +516,21 @@ def audio_chunk_to_bytes(audio_chunk: torch.Tensor) -> bytes:
     else:
         audio = audio_chunk
     
-    # Ensure it's 1D
     if audio.ndim > 1:
         audio = np.squeeze(audio)
     
-    # Normalize and convert to int16
+    # Remove DC offset
+    audio = audio - np.mean(audio)
+    
+    # Clip
     audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
+    
+    # Add dithering to reduce quantization noise
+    dither = np.random.randn(len(audio)) * 0.0003  # Very subtle dither
+    audio = audio + dither
+    audio = np.clip(audio, -1.0, 1.0)
+    
+    # Convert to int16
     audio_int16 = (audio * 32767).astype(np.int16)
     
     return audio_int16.tobytes()
@@ -685,8 +691,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             else:
                 formatted_text = text
         
-        # NOTE: The character replacement below had an encoding issue, corrected it.
-        formatted_text = formatted_text.replace("â€™", "'")
+        formatted_text = formatted_text.replace("'", "'")
         
         # Process inputs
         inputs = processor(
@@ -702,17 +707,18 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             if torch.is_tensor(v):
                 inputs[k] = v.to(device, non_blocking=True)
         
-        # Use AsyncAudioStreamer for async context
+        # CRITICAL FIX: Reinitialize scheduler steps before generation
+        model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
+        
+        # Use AsyncAudioStreamer
         from vibevoice.modular.streamer import AsyncAudioStreamer
         audio_streamer = AsyncAudioStreamer(batch_size=1)
         
-        # Create thread-safe stop flag
         stop_flag = threading.Event()
         
         def should_stop():
             return stop_flag.is_set()
         
-        # Start generation in a separate thread
         def run_generation():
             try:
                 with torch.inference_mode():
@@ -743,39 +749,30 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
                 logger.error(f"Generation error: {e}")
                 logger.error(traceback.format_exc())
         
-        # Start generation in thread
-        generation_task = asyncio.create_task(
-            asyncio.to_thread(run_generation)
-        )
+        generation_task = asyncio.create_task(asyncio.to_thread(run_generation))
         
-        # Chunk accumulation configuration
-        CHUNK_ACCUMULATION_SIZE = 4800  # ~200ms at 24kHz
+        # INCREASED chunk size to reduce clicks/pops
+        CHUNK_ACCUMULATION_SIZE = 12000  # 500ms at 24kHz - smoother playback
         accumulated_audio = []
         accumulated_samples = 0
         chunk_count = 0
         
-        # Stream audio chunks as they become available
         try:
             async for audio_chunk in audio_streamer.get_stream(0):
                 numpy_chunk = audio_chunk.to(torch.float32).cpu().numpy()
                 
-                # Accumulate the numpy arrays instead of tensors.
                 accumulated_audio.append(numpy_chunk)
                 accumulated_samples += numpy_chunk.size
-                # ### FIX END ###
                 
-                # Only send when we have enough samples
                 if accumulated_samples >= CHUNK_ACCUMULATION_SIZE:
-                    # Combine accumulated chunks
                     combined_chunk = np.concatenate(accumulated_audio)
+                    
+                    # Apply crossfade to reduce clicks
+                    combined_chunk = apply_crossfade(combined_chunk, SAMPLE_RATE)
+                    
                     chunk_count += 1
-                    
-                    print(f"Chunk {chunk_count}: samples={len(combined_chunk)}, duration={len(combined_chunk)/SAMPLE_RATE*1000:.1f}ms, min={combined_chunk.min():.3f}, max={combined_chunk.max():.3f}")
-                    
-                    # Convert audio chunk to bytes
                     audio_bytes = audio_chunk_to_bytes(combined_chunk)
                     
-                    # Create the streaming data
                     chunk_data = {
                         "type": "audio_chunk",
                         "chunk_id": chunk_count,
@@ -787,16 +784,14 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
                     
                     yield chunk_data
                     
-                    # Reset accumulator
                     accumulated_audio = []
                     accumulated_samples = 0
             
-            # Send any remaining audio after stream ends
+            # Send remaining audio
             if accumulated_audio:
                 combined_chunk = np.concatenate(accumulated_audio)
+                combined_chunk = apply_crossfade(combined_chunk, SAMPLE_RATE)
                 chunk_count += 1
-                
-                print(f"Final chunk {chunk_count}: samples={len(combined_chunk)}, duration={len(combined_chunk)/SAMPLE_RATE*1000:.1f}ms")
                 
                 audio_bytes = audio_chunk_to_bytes(combined_chunk)
                 
@@ -812,38 +807,46 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         except Exception as e:
             logger.error(f"Error in streaming: {e}")
             logger.error(traceback.format_exc())
-            stop_flag.set()  # Signal to stop generation
-            yield {
-                "type": "error",
-                "message": str(e),
-                "timestamp": time.time()
-            }
+            stop_flag.set()
+            yield {"type": "error", "message": str(e), "timestamp": time.time()}
         
         finally:
-            # Wait for generation to complete
             try:
                 await generation_task
             except Exception as e:
                 logger.error(f"Generation task error: {e}")
             
-            # Send completion signal
             yield {
                 "type": "complete",
                 "total_chunks": chunk_count,
                 "timestamp": time.time()
             }
         
-        # Update streaming stats
         performance_stats["streaming_requests"] += 1
         
     except Exception as e:
         logger.error(f"Streaming generation failed: {e}")
         logger.error(traceback.format_exc())
-        yield {
-            "type": "error", 
-            "message": str(e),
-            "timestamp": time.time()
-        }
+        yield {"type": "error", "message": str(e), "timestamp": time.time()}
+
+def apply_crossfade(audio: np.ndarray, sample_rate: int, fade_ms: int = 10) -> np.ndarray:
+    """Apply fade-in and fade-out to reduce clicks."""
+    fade_samples = int(sample_rate * fade_ms / 1000)
+    fade_samples = min(fade_samples, len(audio) // 4)  # Max 25% of audio
+    
+    if len(audio) < fade_samples * 2:
+        return audio
+    
+    # Create fade curves
+    fade_in = np.linspace(0, 1, fade_samples)
+    fade_out = np.linspace(1, 0, fade_samples)
+    
+    # Apply fades
+    audio[:fade_samples] *= fade_in
+    audio[-fade_samples:] *= fade_out
+    
+    return audio
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting VibeVoice Inference Server v2.2...")
@@ -1126,106 +1129,100 @@ async def multi_speaker_tts(
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/single-speaker-stream")
-async def single_speaker_tts_stream(
-    text: str = Form(...),
-    voice_file: UploadFile = File(...)
-):
-    """Single speaker TTS with real-time streaming via SSE."""
-    try:
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="Text cannot be empty")
-        
-        if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
-            raise HTTPException(status_code=400, detail="Unsupported audio format")
-        
-        audio_bytes = await voice_file.read()
-        voice_sample = preprocess_audio(audio_bytes, voice_file.filename)
-        
-        # Create async generator for streaming
-        async def stream_generator():
-            try:
-                async for chunk_data in generate_streaming_audio(text, [voice_sample]):
-                    
-                    yield {
-                        "event": chunk_data.pop("type", "message"),
-                        "data": json.dumps(chunk_data)
-                    }
-                    
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                yield {
-                    "event": "error",
-                    "data": json.dumps({'message': str(e)})
-                }
-        
-        return EventSourceResponse(
-            stream_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no"  # Disable nginx buffering
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Single speaker streaming failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.websocket("/ws/tts-stream")
+async def websocket_tts_stream(websocket: WebSocket):
+    """WebSocket endpoint for streaming TTS with persistent connection."""
+    await websocket.accept()
+    logger.info("WebSocket connection established")
     
-@app.post("/multi-speaker-stream")
-async def multi_speaker_tts_stream(
-    text: str = Form(...),
-    voice_files: List[UploadFile] = File(...)
-):
-    """Multi-speaker TTS with real-time streaming via SSE."""
     try:
-        # Validate inputs
+        # Receive configuration
+        config_data = await websocket.receive_json()
+        
+        text = config_data.get('text', '')
+        generation_type = config_data.get('type', 'single')  # 'single' or 'multi'
+        voice_files_data = config_data.get('voice_files', [])
+        
         if not text.strip():
-            raise HTTPException(status_code=400, detail="Text cannot be empty")
+            await websocket.send_json({
+                "type": "error",
+                "message": "Text cannot be empty"
+            })
+            return
         
-        if not voice_files:
-            raise HTTPException(status_code=400, detail="At least one voice file required")
+        # Process voice files from base64
+        voice_samples = []
+        for idx, voice_data in enumerate(voice_files_data):
+            try:
+                # Decode base64 audio
+                audio_bytes = base64.b64decode(voice_data['data'])
+                voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
+                voice_samples.append(voice_sample)
+            except Exception as e:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Failed to process voice file {idx}: {str(e)}"
+                })
+                return
         
-        if "Speaker" not in text:
-            raise HTTPException(
-                status_code=400,
-                detail="Text must contain speaker labels (e.g., 'Speaker 1: Hello\\nSpeaker 2: Hi')"
-            )
+        # Validate speaker count
+        if generation_type == 'multi' and len(voice_samples) < 2:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Multi-speaker requires at least 2 voices"
+            })
+            return
         
-        # Process voice files
-        async def process_voice_file(voice_file, index):
-            if not voice_file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported audio format in file {index+1}: {voice_file.filename}"
-                )
-            
-            audio_bytes = await voice_file.read()
-            return preprocess_audio(audio_bytes, voice_file.filename)
+        # Send ready signal
+        await websocket.send_json({
+            "type": "ready",
+            "message": "Starting generation"
+        })
         
-        # Process files concurrently
-        tasks = [process_voice_file(vf, i) for i, vf in enumerate(voice_files)]
-        voice_samples = await asyncio.gather(*tasks)
+        # Generate and stream audio
+        chunk_count = 0
+        all_chunks = []
         
-        # Create async generator for streaming
-        async def stream_generator():
-            async for chunk_data in generate_streaming_audio(text, voice_samples):
-                yield {
-                    "event": chunk_data.pop("type", "message"),
-                    "data": json.dumps(chunk_data)
-                }
+        async for chunk_data in generate_streaming_audio(text, voice_samples):
+            if chunk_data["type"] == "audio_chunk":
+                chunk_count += 1
+                all_chunks.append(chunk_data)
                 
+                # Send chunk immediately
+                await websocket.send_json(chunk_data)
+                
+            elif chunk_data["type"] == "complete":
+                await websocket.send_json({
+                    "type": "complete",
+                    "total_chunks": chunk_count,
+                    "timestamp": time.time()
+                })
+                break
+                
+            elif chunk_data["type"] == "error":
+                await websocket.send_json(chunk_data)
+                break
         
-        return EventSourceResponse(stream_generator(), media_type="text/event-stream")
+        logger.info(f"WebSocket streaming completed: {chunk_count} chunks sent")
         
-    except HTTPException:
-        raise
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
     except Exception as e:
-        logger.error(f"Multi-speaker streaming failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+        logger.error(f"WebSocket error: {e}")
+        logger.error(traceback.format_exc())
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e),
+                "timestamp": time.time()
+            })
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
