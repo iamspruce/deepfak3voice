@@ -516,18 +516,25 @@ def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
     else:
         audio = audio_chunk
     
+    # This squeeze might be redundant if the tensor is already squeezed, but it's safe to keep.
+    if audio.ndim > 1 and audio.shape[0] == 1:
+         audio = np.squeeze(audio, axis=0)
+
+    # Remove DC offset (handle both mono and multi-channel)
     if audio.ndim > 1:
-        audio = np.squeeze(audio)
-    
-    # Remove DC offset
-    audio = audio - np.mean(audio)
+        # For multi-channel, subtract mean from each channel independently
+        audio = audio - np.mean(audio, axis=1, keepdims=True)
+    else:
+        # For mono
+        audio = audio - np.mean(audio)
     
     # Clip
     audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
     
-    # Add dithering to reduce quantization noise
-    dither = np.random.randn(len(audio)) * 0.0003  # Very subtle dither
+   
+    dither = np.random.uniform(-1, 1, size=audio.shape) * (1 / 32767.0) # More correct dithering
     audio = audio + dither
+
     audio = np.clip(audio, -1.0, 1.0)
     
     # Convert to int16
