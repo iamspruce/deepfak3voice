@@ -55,6 +55,12 @@ GUMROAD_PRODUCT_ID = "Apv6fptxqEqWgANZQAtsfQ=="
 LICENSE_GRACE_PERIOD = 86400  # 24 hours in seconds
 license_cache = {}  # {license_key: {valid: bool, last_check: timestamp, purchase_info: dict}}
 
+
+voice_cache = {}  # {cache_key: preprocessed_voice_sample}
+voice_cache_lock = threading.Lock()
+
+
+
 app = FastAPI(
     title="VibeVoice Inference Server",
     description="FastAPI server for VibeVoice text-to-speech with streaming and dynamic model selection",
@@ -129,6 +135,22 @@ class StreamingConfig(BaseModel):
     chunk_duration_ms: int = 200  # Duration of each audio chunk in milliseconds
     buffer_size: int = 4  # Number of chunks to buffer
     sample_rate: int = 24000
+
+
+def get_voice_cache_key(generation_type: str, voice_ids: List[str]) -> str:
+    """Generate cache key for voice samples."""
+    return f"{generation_type}:{'|'.join(sorted(voice_ids))}"
+
+def cache_voice_samples(cache_key: str, voice_samples: List[np.ndarray]):
+    """Cache preprocessed voice samples."""
+    with voice_cache_lock:
+        voice_cache[cache_key] = voice_samples
+        logger.info(f"Cached voice samples for key: {cache_key}")
+
+def get_cached_voice_samples(cache_key: str) -> Optional[List[np.ndarray]]:
+    """Get cached voice samples if available."""
+    with voice_cache_lock:
+        return voice_cache.get(cache_key)
 
 def get_detailed_gpu_info():
     """Get comprehensive GPU information."""
@@ -1151,18 +1173,13 @@ async def multi_speaker_tts(
 
 @app.websocket("/ws/tts-stream")
 async def websocket_tts_stream(websocket: WebSocket):
-    """
-    WebSocket endpoint for streaming TTS with a persistent connection,
-    capable of handling multiple generation jobs sequentially.
-    """
+    """WebSocket endpoint with voice caching."""
     await websocket.accept()
-    logger.info("WebSocket connection established. Awaiting requests.")
+    logger.info("WebSocket connection established.")
 
     try:
-        # This main loop keeps the connection alive to listen for multiple jobs.
         while True:
             try:
-                # 1. Wait for and receive the configuration for a new job.
                 config_data = await websocket.receive_json()
                 logger.info("Received new TTS request.")
 
@@ -1170,22 +1187,35 @@ async def websocket_tts_stream(websocket: WebSocket):
                 generation_type = config_data.get('type', 'single')
                 voice_files_data = config_data.get('voice_files', [])
 
-                # 2. Validate the incoming request data for this specific job.
                 if not text.strip():
                     await websocket.send_json({
                         "type": "error",
                         "message": "Text cannot be empty"
                     })
-                    continue # Skip to the next iteration, awaiting a new job.
+                    continue
 
-                # 3. Process voice files from base64.
-                voice_samples = []
-                for idx, voice_data in enumerate(voice_files_data):
-                    audio_bytes = base64.b64decode(voice_data['data'])
-                    voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
-                    voice_samples.append(voice_sample)
+                # Generate cache key
+                if generation_type == 'single':
+                    cache_key = get_voice_cache_key(generation_type, ["single"])
+                else:
+                    cache_key = get_voice_cache_key(generation_type, [f"voice_{i}" for i in range(len(voice_files_data))])
 
-                # More validation for this specific job.
+                # Try to get from cache
+                voice_samples = get_cached_voice_samples(cache_key)
+
+                if voice_samples is None:
+                    # Process and cache voice files
+                    logger.info("Processing and caching voice samples...")
+                    voice_samples = []
+                    for idx, voice_data in enumerate(voice_files_data):
+                        audio_bytes = base64.b64decode(voice_data['data'])
+                        voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
+                        voice_samples.append(voice_sample)
+                    
+                    cache_voice_samples(cache_key, voice_samples)
+                else:
+                    logger.info("Using cached voice samples.")
+
                 if generation_type == 'multi' and len(voice_samples) < 2:
                     await websocket.send_json({
                         "type": "error",
@@ -1193,57 +1223,73 @@ async def websocket_tts_stream(websocket: WebSocket):
                     })
                     continue
 
-                # 4. Signal that the server is ready to start this job.
                 await websocket.send_json({
                     "type": "ready",
-                    "message": "Configuration received. Starting generation."
+                    "message": "Starting generation."
                 })
 
-                # 5. Generate and stream the audio for the current job.
                 chunk_count = 0
                 async for chunk_data in generate_streaming_audio(text, voice_samples):
-                    await websocket.send_json(chunk_data)
-                    if chunk_data["type"] == "audio_chunk":
-                        chunk_count += 1
-                    # If the generator signals completion or an error, stop this job's stream.
-                    elif chunk_data["type"] in ["complete", "error"]:
+                    try:
+                        await websocket.send_json(chunk_data)
+                        if chunk_data["type"] == "audio_chunk":
+                            chunk_count += 1
+                        elif chunk_data["type"] in ["complete", "error"]:
+                            break
+                    except RuntimeError as e:
+                        # Connection closed during send
+                        logger.info(f"Connection closed during streaming: {e}")
                         break
+                    
                 
-                logger.info(f"Streaming completed for job: {chunk_count} chunks sent.")
+                logger.info(f"Streaming completed: {chunk_count} chunks sent.")
 
-            # This inner 'except' handles errors for a *single job* without killing the connection.
             except Exception as e:
-                logger.error(f"Error processing a TTS job: {e}")
-                logger.error(traceback.format_exc())
-                # Try to send an error message to the client for this specific failed job.
+                logger.error(f"Error processing TTS job: {e}")
                 try:
                     await websocket.send_json({
                         "type": "error",
-                        "message": f"An internal error occurred: {str(e)}"
+                        "message": str(e)
                     })
-                except Exception as send_error:
-                    logger.error(f"Failed to send error message to client: {send_error}")
-                # 'continue' ensures the server is ready for the next job on the same connection.
+                except:
+                    pass
                 continue
 
-    # This outer 'except' catches the client disconnecting.
+            except WebSocketDisconnect:
+                logger.info("Client disconnected during job.")
+                break  # Exit the while loop
+            except RuntimeError as e:
+                if "disconnect" in str(e).lower():
+                    logger.info("Client disconnected.")
+                    break  # Exit the while loop
+                else:
+                    logger.error(f"Runtime error: {e}")
+                    break
+            except Exception as e:
+                logger.error(f"Error processing TTS job: {e}")
+                logger.error(traceback.format_exc())
+                # Try to send error, but don't fail if connection is closed
+                try:
+                    if websocket.client_state.name == "CONNECTED":
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": str(e)
+                        })
+                except:
+                    pass
+                break  # Exit on error
+
     except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected.")
-
-    # This is for any other unexpected errors that might break the main loop.
+        logger.info("WebSocket disconnected.")
     except Exception as e:
-        logger.error(f"A fatal error occurred in the WebSocket handler: {e}")
-        logger.error(traceback.format_exc())
-
-    # The 'finally' block ensures cleanup happens only when the connection is truly over.
+        logger.error(f"Fatal WebSocket error: {e}")
     finally:
         logger.info("Closing WebSocket connection.")
         try:
             await websocket.close()
-        except RuntimeError:
-            # This can happen if the connection is already closed, which is fine.
+        except:
             pass
-     
+          
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
