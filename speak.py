@@ -24,7 +24,7 @@ from huggingface_hub import snapshot_download
 import psutil
 import GPUtil
 from sse_starlette.sse import EventSourceResponse
-import json
+import re
 
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -585,7 +585,7 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
         if num_speakers == 1:
             formatted_text = f"Speaker 1: {text.strip()}"
         else:
-            if "Speaker" not in text:
+            if not re.search(r"^\s*Speaker\s+\d+\s*:", text, re.MULTILINE):
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 if lines:
                     formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
@@ -710,7 +710,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         if num_speakers == 1:
             formatted_text = f"Speaker 1: {text.strip()}"
         else:
-            if "Speaker" not in text:
+            if not re.search(r"^\s*Speaker\s+\d+\s*:", text, re.MULTILINE):
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 if lines:
                     formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
