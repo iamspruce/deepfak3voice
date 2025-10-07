@@ -81,6 +81,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install pyinstaller
+
+           # On Linux, install the smaller GPU-enabled PyTorch for CUDA 12.1
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            echo "Installing PyTorch for CUDA 12.1 on Linux..."
+            pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+          fi
+
+          # Install the rest of the packages from requirements.txt
+          # On Linux, this will skip torch/torchaudio as they're already installed
           pip install -r requirements.txt
 
       - name: Clean pip cache
@@ -552,7 +561,7 @@ jobs:
             ## ⚠️ Important Notes
 
             ### System Requirements
-            - **FFmpeg & SoX** must be installed separately
+            - **FFmpeg** must be installed separately
             - **CUDA 12.1+** required for GPU acceleration
             - **8GB+ RAM** recommended
             - **5GB+ storage** for models
