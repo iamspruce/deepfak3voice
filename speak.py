@@ -781,7 +781,7 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
         generation_task = asyncio.create_task(asyncio.to_thread(run_generation))
         
         # INCREASED chunk size to reduce clicks/pops
-        CHUNK_ACCUMULATION_SIZE = 12000  # 500ms at 24kHz - smoother playback
+        CHUNK_ACCUMULATION_SIZE = 18000  # 750ms at 24kHz - smoother playback
         accumulated_audio = []
         accumulated_samples = 0
         chunk_count = 0
