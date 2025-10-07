@@ -22,6 +22,7 @@ numpy<2.0.0
 opencv-python==4.9.0.80
 opencv-contrib-python==4.9.0.80
 opencv-python-headless==4.9.0.80
+thinc==8.2.3
 pandas>=2.0.0
 
 # API and networking
