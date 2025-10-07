@@ -19,6 +19,9 @@ scipy>=1.11.0
 
 # Data processing
 numpy<2.0.0
+opencv-python==4.9.0.80
+opencv-contrib-python==4.9.0.80
+opencv-python-headless==4.9.0.80
 pandas>=2.0.0
 
 # API and networking
