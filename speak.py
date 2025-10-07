@@ -1244,6 +1244,25 @@ async def websocket_tts_stream(websocket: WebSocket):
                 
                 logger.info(f"Streaming completed: {chunk_count} chunks sent.")
 
+            except WebSocketDisconnect:
+                logger.info("Client disconnected during job.")
+                break  # Correctly exits the while loop.
+
+            # 2. Catch specific runtime errors related to disconnection.
+            except RuntimeError as e:
+                if "disconnect" in str(e).lower():
+                    logger.info(f"Client disconnected (RuntimeError): {e}")
+                    break  # Correctly exits the while loop.
+                else:
+                    # Handle other unexpected runtime errors
+                    logger.error(f"An unexpected runtime error occurred: {e}")
+                    try:
+                        await websocket.send_json({"type": "error", "message": f"Runtime error: {e}"})
+                    except:
+                        pass # Connection might be broken
+                    break # Exit loop on unexpected runtime errors too
+
+            # 3. Catch all other general exceptions last.
             except Exception as e:
                 logger.error(f"Error processing TTS job: {e}")
                 try:
@@ -1253,32 +1272,12 @@ async def websocket_tts_stream(websocket: WebSocket):
                     })
                 except:
                     pass
+                # Use 'continue' ONLY if you want the server to be ready for a
+                # new job on the same connection after a recoverable error.
+                # If any error should terminate the session, use 'break'.
+                # For this case, 'continue' is acceptable for non-fatal errors.
                 continue
-
-            except WebSocketDisconnect:
-                logger.info("Client disconnected during job.")
-                break  # Exit the while loop
-            except RuntimeError as e:
-                if "disconnect" in str(e).lower():
-                    logger.info("Client disconnected.")
-                    break  # Exit the while loop
-                else:
-                    logger.error(f"Runtime error: {e}")
-                    break
-            except Exception as e:
-                logger.error(f"Error processing TTS job: {e}")
-                logger.error(traceback.format_exc())
-                # Try to send error, but don't fail if connection is closed
-                try:
-                    if websocket.client_state.name == "CONNECTED":
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": str(e)
-                        })
-                except:
-                    pass
-                break  # Exit on error
-
+            
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
     except Exception as e:
