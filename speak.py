@@ -1173,122 +1173,76 @@ async def multi_speaker_tts(
 
 @app.websocket("/ws/tts-stream")
 async def websocket_tts_stream(websocket: WebSocket):
-    """WebSocket endpoint with voice caching."""
+    """WebSocket endpoint that handles multiple, sequential jobs on a single connection."""
     await websocket.accept()
-    logger.info("WebSocket connection established.")
+    logger.info("WebSocket connection established. Ready for multiple jobs.")
 
     try:
+        # This outer loop keeps the connection alive, waiting for new job requests.
         while True:
             try:
+                # 1. Wait for a new job configuration from the client.
                 config_data = await websocket.receive_json()
-                logger.info("Received new TTS request.")
+                logger.info(f"Received job request: {config_data}")
 
-                text = config_data.get('text', '')
-                generation_type = config_data.get('type', 'single')
-                voice_files_data = config_data.get('voice_files', [])
-
-                if not text.strip():
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Text cannot be empty"
-                    })
+                # 2. Handle a "stop" message from the client.
+                # This is a special case and doesn't start a new job.
+                if config_data.get('type') == 'stop':
+                    logger.info("Ignoring 'stop' message as no job is currently running.")
                     continue
 
-                # Generate cache key
+                text = config_data.get('text', '')
+                if not text.strip():
+                    await websocket.send_json({"type": "error", "message": "Text cannot be empty"})
+                    continue # Wait for the next valid job request.
+
+                # ... (your existing logic for getting voice_samples and caching) ...
+                generation_type = config_data.get('type', 'single')
+                voice_files_data = config_data.get('voice_files', [])
+                
+                # Generate cache key and get/process voice_samples as before...
+                # (This part of your code is good, no changes needed here)
                 if generation_type == 'single':
                     cache_key = get_voice_cache_key(generation_type, ["single"])
                 else:
                     cache_key = get_voice_cache_key(generation_type, [f"voice_{i}" for i in range(len(voice_files_data))])
-
-                # Try to get from cache
                 voice_samples = get_cached_voice_samples(cache_key)
-
                 if voice_samples is None:
-                    # Process and cache voice files
-                    logger.info("Processing and caching voice samples...")
                     voice_samples = []
                     for idx, voice_data in enumerate(voice_files_data):
                         audio_bytes = base64.b64decode(voice_data['data'])
                         voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
                         voice_samples.append(voice_sample)
-                    
                     cache_voice_samples(cache_key, voice_samples)
-                else:
-                    logger.info("Using cached voice samples.")
 
-                if generation_type == 'multi' and len(voice_samples) < 2:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Multi-speaker requires at least 2 voices"
-                    })
-                    continue
 
-                await websocket.send_json({
-                    "type": "ready",
-                    "message": "Starting generation."
-                })
+                # 3. Inform the client that the job is starting.
+                await websocket.send_json({"type": "ready", "message": "Starting generation."})
 
+                # 4. Begin streaming audio for the current job.
                 chunk_count = 0
                 async for chunk_data in generate_streaming_audio(text, voice_samples):
-                    try:
-                        await websocket.send_json(chunk_data)
-                        if chunk_data["type"] == "audio_chunk":
-                            chunk_count += 1
-                        elif chunk_data["type"] in ["complete", "error"]:
-                            break
-                    except RuntimeError as e:
-                        # Connection closed during send
-                        logger.info(f"Connection closed during streaming: {e}")
-                        break
-                    
+                    await websocket.send_json(chunk_data)
+                    if chunk_data["type"] in ["complete", "error"]:
+                        break # Exit the generator loop for this job
                 
-                logger.info(f"Streaming completed: {chunk_count} chunks sent.")
+                logger.info(f"Job finished. Ready for next job.")
 
             except WebSocketDisconnect:
-                logger.info("Client disconnected during job.")
-                break  # Correctly exits the while loop.
+                logger.info("Client disconnected.")
+                break # Exit the main while loop
 
-            # 2. Catch specific runtime errors related to disconnection.
-            except RuntimeError as e:
-                if "disconnect" in str(e).lower():
-                    logger.info(f"Client disconnected (RuntimeError): {e}")
-                    break  # Correctly exits the while loop.
-                else:
-                    # Handle other unexpected runtime errors
-                    logger.error(f"An unexpected runtime error occurred: {e}")
-                    try:
-                        await websocket.send_json({"type": "error", "message": f"Runtime error: {e}"})
-                    except:
-                        pass # Connection might be broken
-                    break # Exit loop on unexpected runtime errors too
-
-            # 3. Catch all other general exceptions last.
             except Exception as e:
-                logger.error(f"Error processing TTS job: {e}")
+                logger.error(f"Error during job: {e}")
                 try:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": str(e)
-                    })
+                    await websocket.send_json({"type": "error", "message": str(e)})
                 except:
-                    pass
-                # Use 'continue' ONLY if you want the server to be ready for a
-                # new job on the same connection after a recoverable error.
-                # If any error should terminate the session, use 'break'.
-                # For this case, 'continue' is acceptable for non-fatal errors.
+                    pass # Connection might be broken
+                # Continue to the next iteration to allow for a new job.
                 continue
-            
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected.")
-    except Exception as e:
-        logger.error(f"Fatal WebSocket error: {e}")
+
     finally:
-        logger.info("Closing WebSocket connection.")
-        try:
-            await websocket.close()
-        except:
-            pass
-          
+        logger.info("Closing WebSocket connection.")        
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
