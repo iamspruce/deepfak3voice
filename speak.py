@@ -1078,18 +1078,19 @@ async def multi_speaker_tts(
 
 @app.websocket("/ws/tts-stream")
 async def websocket_tts_stream(websocket: WebSocket):
-    """WebSocket endpoint that handles multiple, sequential jobs on a single connection."""
+    """WebSocket endpoint for streaming TTS."""
     await websocket.accept()
-    logger.info("WebSocket connection established. Ready for multiple jobs.")
+    logger.info("WebSocket connection established")
 
     try:
         while True:
             try:
+                # Wait for job configuration
                 config_data = await websocket.receive_json()
                 logger.info(f"Received job request: {config_data}")
 
                 if config_data.get('type') == 'stop':
-                    logger.info("Ignoring 'stop' message as no job is currently running.")
+                    logger.info("Stop request received")
                     continue
 
                 text = config_data.get('text', '')
@@ -1100,9 +1101,10 @@ async def websocket_tts_stream(websocket: WebSocket):
                 generation_type = config_data.get('type', 'single')
                 voice_files_data = config_data.get('voice_files', [])
                 
-                # Updated caching with hash key
+                # Process voice samples
                 cache_key = get_voice_cache_key(generation_type, voice_files_data)
                 voice_samples = get_cached_voice_samples(cache_key)
+                
                 if voice_samples is None:
                     voice_samples = []
                     for idx, voice_data in enumerate(voice_files_data):
@@ -1111,60 +1113,47 @@ async def websocket_tts_stream(websocket: WebSocket):
                         voice_samples.append(voice_sample)
                     cache_voice_samples(cache_key, voice_samples)
 
-                # Stop flag for this job
+                # Create stop flag for this job
                 stop_flag = asyncio.Event()
 
-                # Concurrent tasks: generation and message listener for stop
-                gen_task = asyncio.create_task(
-                    handle_streaming_job(websocket, text, voice_samples, model, processor, device, stop_flag)
-                )
-                msg_task = asyncio.create_task(websocket.receive_json())
-
-                done, pending = await asyncio.wait([gen_task, msg_task], return_when=asyncio.FIRST_COMPLETED)
-
-                for task in pending:
-                    task.cancel()
-
-                if msg_task in done:
-                    # Stop received: set flag and wait for gen to wind down
-                    config_data = await msg_task  # Get the stop message
-                    if config_data.get('type') == 'stop':
-                        stop_flag.set()
-                        await gen_task
-                        await websocket.send_json({"type": "stopped", "message": "Stream stopped by client"})
-                else:
-                    # Gen completed naturally
-                    await msg_task  # Cancel listener
-                    await gen_task
-
-                logger.info(f"Job finished. Ready for next job.")
+                # Generate and stream audio
+                try:
+                    async for message in generate_streaming_audio(
+                        text, voice_samples, model, processor, device, stop_flag
+                    ):
+                        if isinstance(message, tuple):
+                            # Binary audio chunk
+                            audio_bytes, metadata = message
+                            await websocket.send_bytes(audio_bytes)
+                        else:
+                            # JSON control message
+                            await websocket.send_json(message)
+                            
+                    logger.info("Job completed successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Error during generation: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(e)
+                    })
 
             except WebSocketDisconnect:
-                logger.info("Client disconnected.")
+                logger.info("Client disconnected")
                 break
-
+                
             except Exception as e:
-                logger.error(f"Error during job: {e}")
+                logger.error(f"Error in job loop: {e}")
                 try:
-                    await websocket.send_json({"type": "error", "message": str(e)})
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(e)
+                    })
                 except:
-                    pass
-                continue
-
+                    break
+                    
     finally:
-        logger.info("Closing WebSocket connection.")
-
-async def handle_streaming_job(websocket: WebSocket, text: str, voice_samples: list, model, processor, device, stop_flag: asyncio.Event):
-    """Helper to run the generator and send messages."""
-    async for message in generate_streaming_audio(text, voice_samples, model, processor, device, stop_flag):
-        if isinstance(message, tuple):
-            # Binary chunk
-            audio_bytes, metadata = message
-            await websocket.send_bytes(audio_bytes)
-            # Optional: Send metadata as JSON if needed, but skip for efficiency
-        else:
-            # JSON control
-            await websocket.send_json(message)
+        logger.info("Closing WebSocket connection")
             
 @app.post("/reload-model")
 async def reload_model():
