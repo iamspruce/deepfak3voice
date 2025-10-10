@@ -4,7 +4,7 @@ import time
 import io
 import wave
 import logging
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Tuple, Union
 from pathlib import Path
 import traceback
 import asyncio
@@ -25,6 +25,8 @@ import psutil
 import GPUtil
 from sse_starlette.sse import EventSourceResponse
 import re
+import hashlib
+
 
 # Import your VibeVoice components
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -55,11 +57,8 @@ GUMROAD_PRODUCT_ID = "Apv6fptxqEqWgANZQAtsfQ=="
 LICENSE_GRACE_PERIOD = 86400  # 24 hours in seconds
 license_cache = {}  # {license_key: {valid: bool, last_check: timestamp, purchase_info: dict}}
 
-
 voice_cache = {}  # {cache_key: preprocessed_voice_sample}
 voice_cache_lock = threading.Lock()
-
-
 
 app = FastAPI(
     title="VibeVoice Inference Server",
@@ -137,9 +136,18 @@ class StreamingConfig(BaseModel):
     sample_rate: int = 24000
 
 
-def get_voice_cache_key(generation_type: str, voice_ids: List[str]) -> str:
-    """Generate cache key for voice samples."""
-    return f"{generation_type}:{'|'.join(sorted(voice_ids))}"
+def get_voice_cache_key(generation_type: str, voice_files_data: List[Dict]) -> str:
+    """Generate cache key for voice samples using content hash."""
+    if generation_type == 'single':
+        if not voice_files_data:
+            return "single:empty"
+        voice_hash = hashlib.md5(voice_files_data[0]['data'].encode()).hexdigest()
+        return f"single:{voice_hash}"
+    else:
+        if not voice_files_data:
+            return "multi:empty"
+        voice_hashes = [hashlib.md5(data['data'].encode()).hexdigest() for data in voice_files_data]
+        return f"multi:{'|'.join(sorted(voice_hashes))}"
 
 def cache_voice_samples(cache_key: str, voice_samples: List[np.ndarray]):
     """Cache preprocessed voice samples."""
@@ -151,7 +159,7 @@ def get_cached_voice_samples(cache_key: str) -> Optional[List[np.ndarray]]:
     """Get cached voice samples if available."""
     with voice_cache_lock:
         return voice_cache.get(cache_key)
-
+    
 def get_detailed_gpu_info():
     """Get comprehensive GPU information."""
     try:
@@ -526,8 +534,8 @@ def audio_to_bytes(audio: np.ndarray) -> bytes:
     
     return byte_io.getvalue()
 
-def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
-    """Convert audio chunk to bytes with dithering."""
+""" def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
+    Convert audio chunk to bytes with dithering.
     if isinstance(audio_chunk, torch.Tensor):
         if audio_chunk.ndim > 1:
             audio_chunk = audio_chunk.squeeze(0)
@@ -562,6 +570,19 @@ def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
     # Convert to int16
     audio_int16 = (audio * 32767).astype(np.int16)
     
+    return audio_int16.tobytes()
+ """
+
+def audio_chunk_to_bytes(audio: np.ndarray | torch.Tensor) -> bytes:
+    """Minimal conversion - just to int16 bytes."""
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+    
+    # Ensure 1D
+    audio = audio.squeeze() if audio.ndim > 1 else audio
+    
+    # Direct conversion (model should output clean audio already)
+    audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
     return audio_int16.tobytes()
 
 async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tuple[np.ndarray, AudioStats]:
@@ -694,35 +715,21 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
-async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -> AsyncGenerator[Dict[str, Any], None]:
-    """Generate streaming audio with real-time chunks."""
-    if model is None or processor is None:
-        yield {"type": "error", "message": "Model not loaded", "timestamp": time.time()}
-        return
-    
-    if not warmup_complete:
-        yield {"type": "error", "message": "Model warming up", "timestamp": time.time()}
-        return
-    
+async def generate_streaming_audio(
+    text: str, 
+    voice_samples: list,
+    model,
+    processor,
+    device,
+    stop_flag: asyncio.Event = None  # Add stop_flag param
+) -> AsyncGenerator[Union[Dict[str, Any], Tuple[bytes, Dict[str, Any]]], None]:
+    """
+    Zero-latency streaming with binary yields andstop support.
+    Yields dict for JSON control, (bytes, metadata) for binary chunks.
+    """
     try:
-        # Format text
-        num_speakers = len(voice_samples)
-        if num_speakers == 1:
-            formatted_text = f"Speaker 1: {text.strip()}"
-        else:
-            if not re.search(r"^\s*Speaker\s+\d+\s*:", text, re.MULTILINE):
-                lines = [line.strip() for line in text.split("\n") if line.strip()]
-                if lines:
-                    formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
-                    formatted_text = "\n".join(formatted_lines)
-                else:
-                    formatted_text = text
-            else:
-                formatted_text = text
+        formatted_text = format_text_for_tts(text, len(voice_samples))
         
-        formatted_text = formatted_text.replace("'", "'")
-        
-        # Process inputs
         inputs = processor(
             text=[formatted_text],
             voice_samples=voice_samples,
@@ -731,119 +738,61 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
             return_attention_mask=True,
         )
         
-        # Move to device
         for k, v in inputs.items():
             if torch.is_tensor(v):
                 inputs[k] = v.to(device, non_blocking=True)
         
-        # CRITICAL FIX: Reinitialize scheduler steps before generation
-        model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
+        model.set_ddpm_inference_steps(num_steps=50)
         
-        # Use AsyncAudioStreamer
         from vibevoice.modular.streamer import AsyncAudioStreamer
         audio_streamer = AsyncAudioStreamer(batch_size=1)
         
-        stop_flag = threading.Event()
+        async def run_generation():
+            def _generate():
+                try:
+                    with torch.inference_mode():
+                        if str(device) == "cuda":
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                model.generate(
+                                    **inputs,
+                                    max_new_tokens=None,
+                                    cfg_scale=2.0,
+                                    tokenizer=processor.tokenizer,
+                                    generation_config={'do_sample': False},
+                                    verbose=False,
+                                    audio_streamer=audio_streamer,
+                                    stop_check_fn=lambda: stop_flag.is_set() if stop_flag else False,
+                                )
+                        else:
+                            model.generate(**inputs, audio_streamer=audio_streamer)
+                except Exception as e:
+                    print(f"Generation error: {e}")
+            
+            await asyncio.to_thread(_generate)
         
-        def should_stop():
-            return stop_flag.is_set()
+        generation_task = asyncio.create_task(run_generation())
         
-        def run_generation():
-            try:
-                with torch.inference_mode():
-                    if str(device) == "cuda" and torch.cuda.is_available():
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            model.generate(
-                                **inputs,
-                                max_new_tokens=None,
-                                cfg_scale=CFG_SCALE,
-                                tokenizer=processor.tokenizer,
-                                generation_config={'do_sample': False},
-                                verbose=False,
-                                audio_streamer=audio_streamer,
-                                stop_check_fn=should_stop,
-                            )
-                    else:
-                        model.generate(
-                            **inputs,
-                            max_new_tokens=None,
-                            cfg_scale=CFG_SCALE,
-                            tokenizer=processor.tokenizer,
-                            generation_config={'do_sample': False},
-                            verbose=False,
-                            audio_streamer=audio_streamer,
-                            stop_check_fn=should_stop,
-                        )
-            except Exception as e:
-                logger.error(f"Generation error: {e}")
-                logger.error(traceback.format_exc())
+        yield {"type": "ready", "message": "Starting generation."}  # JSON control
         
-        generation_task = asyncio.create_task(asyncio.to_thread(run_generation))
-        
-        # INCREASED chunk size to reduce clicks/pops
-        CHUNK_ACCUMULATION_SIZE = 18000  # 750ms at 24kHz - smoother playback
-        accumulated_audio = []
-        accumulated_samples = 0
         chunk_count = 0
         
         try:
             async for audio_chunk in audio_streamer.get_stream(0):
-                numpy_chunk = audio_chunk.to(torch.float32).cpu().numpy()
+                if stop_flag and stop_flag.is_set():
+                    yield {"type": "stopped", "message": "Generation stopped."}
+                    break
                 
-                accumulated_audio.append(numpy_chunk)
-                accumulated_samples += numpy_chunk.size
-                
-                if accumulated_samples >= CHUNK_ACCUMULATION_SIZE:
-                    combined_chunk = np.concatenate(accumulated_audio)
-                    
-                    # Apply crossfade to reduce clicks
-                    combined_chunk = apply_crossfade(combined_chunk, SAMPLE_RATE)
-                    
-                    chunk_count += 1
-                    audio_bytes = audio_chunk_to_bytes(combined_chunk)
-                    
-                    chunk_data = {
-                        "type": "audio_chunk",
-                        "chunk_id": chunk_count,
-                        "audio_data": audio_bytes.hex(),
-                        "sample_rate": SAMPLE_RATE,
-                        "duration_ms": len(combined_chunk) / SAMPLE_RATE * 1000,
-                        "timestamp": time.time()
-                    }
-                    
-                    yield chunk_data
-                    
-                    accumulated_audio = []
-                    accumulated_samples = 0
-            
-            # Send remaining audio
-            if accumulated_audio:
-                combined_chunk = np.concatenate(accumulated_audio)
-                combined_chunk = apply_crossfade(combined_chunk, SAMPLE_RATE)
                 chunk_count += 1
+                audio_bytes = audio_chunk_to_bytes(audio_chunk)
                 
-                audio_bytes = audio_chunk_to_bytes(combined_chunk)
-                
-                yield {
+                metadata = {
                     "type": "audio_chunk",
                     "chunk_id": chunk_count,
-                    "audio_data": audio_bytes.hex(),
-                    "sample_rate": SAMPLE_RATE,
-                    "duration_ms": len(combined_chunk) / SAMPLE_RATE * 1000,
+                    "sample_rate": 24000,
+                    "samples": len(audio_bytes) // 2,
                     "timestamp": time.time()
                 }
-        
-        except Exception as e:
-            logger.error(f"Error in streaming: {e}")
-            logger.error(traceback.format_exc())
-            stop_flag.set()
-            yield {"type": "error", "message": str(e), "timestamp": time.time()}
-        
-        finally:
-            try:
-                await generation_task
-            except Exception as e:
-                logger.error(f"Generation task error: {e}")
+                yield (audio_bytes, metadata)  # Binary + metadata
             
             yield {
                 "type": "complete",
@@ -851,43 +800,32 @@ async def generate_streaming_audio(text: str, voice_samples: List[np.ndarray]) -
                 "timestamp": time.time()
             }
         
-        performance_stats["streaming_requests"] += 1
+        except Exception as e:
+            yield {"type": "error", "message": str(e)}
         
-    except Exception as e:
-        logger.error(f"Streaming generation failed: {e}")
-        logger.error(traceback.format_exc())
-        yield {"type": "error", "message": str(e), "timestamp": time.time()}
-
-# in your server code
-def apply_crossfade(audio: np.ndarray, sample_rate: int, fade_ms: int = 10) -> np.ndarray:
-    """Apply fade-in and fade-out to reduce clicks."""
-    # Check if the audio is 2D (multi-channel)
-    if audio.ndim == 1:
-        num_samples = len(audio)
-    else:
-        num_samples = audio.shape[1] # Get length from the time axis (columns)
-
-    fade_samples = int(sample_rate * fade_ms / 1000)
-    fade_samples = min(fade_samples, num_samples // 4)
-
-    if num_samples < fade_samples * 2:
-        return audio
-
-    # Create fade curves
-    fade_in = np.linspace(0, 1, fade_samples)
-    fade_out = np.linspace(1, 0, fade_samples)
-
-    # Apply fades correctly to multi-channel audio
-    if audio.ndim == 1:
-        # Mono audio
-        audio[:fade_samples] *= fade_in
-        audio[-fade_samples:] *= fade_out
-    else:
-        # Multi-channel audio: apply fade to every channel
-        audio[:, :fade_samples] *= fade_in
-        audio[:, -fade_samples:] *= fade_out
+        finally:
+            await generation_task
+            if stop_flag:
+                stop_flag.set()  # Ensure clean exit
     
-    return audio
+    except Exception as e:
+        yield {"type": "error", "message": str(e)}
+
+def format_text_for_tts(text: str, num_speakers: int) -> str:
+    """Format text with speaker labels."""
+    import re
+    
+    if num_speakers == 1:
+        return f"Speaker 1: {text.strip()}"
+    
+    if not re.search(r"^\s*Speaker\s+\d+\s*:", text, re.MULTILINE):
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if lines:
+            formatted_lines = [f"Speaker {i+1}: {line}" for i, line in enumerate(lines)]
+            return "\n".join(formatted_lines)
+    
+    return text.replace("'", "'")
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -1178,15 +1116,11 @@ async def websocket_tts_stream(websocket: WebSocket):
     logger.info("WebSocket connection established. Ready for multiple jobs.")
 
     try:
-        # This outer loop keeps the connection alive, waiting for new job requests.
         while True:
             try:
-                # 1. Wait for a new job configuration from the client.
                 config_data = await websocket.receive_json()
                 logger.info(f"Received job request: {config_data}")
 
-                # 2. Handle a "stop" message from the client.
-                # This is a special case and doesn't start a new job.
                 if config_data.get('type') == 'stop':
                     logger.info("Ignoring 'stop' message as no job is currently running.")
                     continue
@@ -1194,18 +1128,13 @@ async def websocket_tts_stream(websocket: WebSocket):
                 text = config_data.get('text', '')
                 if not text.strip():
                     await websocket.send_json({"type": "error", "message": "Text cannot be empty"})
-                    continue # Wait for the next valid job request.
+                    continue
 
-                # ... (your existing logic for getting voice_samples and caching) ...
                 generation_type = config_data.get('type', 'single')
                 voice_files_data = config_data.get('voice_files', [])
                 
-                # Generate cache key and get/process voice_samples as before...
-                # (This part of your code is good, no changes needed here)
-                if generation_type == 'single':
-                    cache_key = get_voice_cache_key(generation_type, ["single"])
-                else:
-                    cache_key = get_voice_cache_key(generation_type, [f"voice_{i}" for i in range(len(voice_files_data))])
+                # Updated caching with hash key
+                cache_key = get_voice_cache_key(generation_type, voice_files_data)
                 voice_samples = get_cached_voice_samples(cache_key)
                 if voice_samples is None:
                     voice_samples = []
@@ -1215,34 +1144,61 @@ async def websocket_tts_stream(websocket: WebSocket):
                         voice_samples.append(voice_sample)
                     cache_voice_samples(cache_key, voice_samples)
 
+                # Stop flag for this job
+                stop_flag = asyncio.Event()
 
-                # 3. Inform the client that the job is starting.
-                await websocket.send_json({"type": "ready", "message": "Starting generation."})
+                # Concurrent tasks: generation and message listener for stop
+                gen_task = asyncio.create_task(
+                    handle_streaming_job(websocket, text, voice_samples, model, processor, device, stop_flag)
+                )
+                msg_task = asyncio.create_task(websocket.receive_json())
 
-                # 4. Begin streaming audio for the current job.
-                chunk_count = 0
-                async for chunk_data in generate_streaming_audio(text, voice_samples):
-                    await websocket.send_json(chunk_data)
-                    if chunk_data["type"] in ["complete", "error"]:
-                        break # Exit the generator loop for this job
-                
+                done, pending = await asyncio.wait([gen_task, msg_task], return_when=asyncio.FIRST_COMPLETED)
+
+                for task in pending:
+                    task.cancel()
+
+                if msg_task in done:
+                    # Stop received: set flag and wait for gen to wind down
+                    config_data = await msg_task  # Get the stop message
+                    if config_data.get('type') == 'stop':
+                        stop_flag.set()
+                        await gen_task
+                        await websocket.send_json({"type": "stopped", "message": "Stream stopped by client"})
+                else:
+                    # Gen completed naturally
+                    await msg_task  # Cancel listener
+                    await gen_task
+
                 logger.info(f"Job finished. Ready for next job.")
 
             except WebSocketDisconnect:
                 logger.info("Client disconnected.")
-                break # Exit the main while loop
+                break
 
             except Exception as e:
                 logger.error(f"Error during job: {e}")
                 try:
                     await websocket.send_json({"type": "error", "message": str(e)})
                 except:
-                    pass # Connection might be broken
-                # Continue to the next iteration to allow for a new job.
+                    pass
                 continue
 
     finally:
-        logger.info("Closing WebSocket connection.")        
+        logger.info("Closing WebSocket connection.")
+
+async def handle_streaming_job(websocket: WebSocket, text: str, voice_samples: list, model, processor, device, stop_flag: asyncio.Event):
+    """Helper to run the generator and send messages."""
+    async for message in generate_streaming_audio(text, voice_samples, model, processor, device, stop_flag):
+        if isinstance(message, tuple):
+            # Binary chunk
+            audio_bytes, metadata = message
+            await websocket.send_bytes(audio_bytes)
+            # Optional: Send metadata as JSON if needed, but skip for efficiency
+        else:
+            # JSON control
+            await websocket.send_json(message)
+            
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
