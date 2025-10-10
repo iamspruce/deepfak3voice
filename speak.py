@@ -534,49 +534,16 @@ def audio_to_bytes(audio: np.ndarray) -> bytes:
     
     return byte_io.getvalue()
 
-""" def audio_chunk_to_bytes(audio_chunk: np.ndarray) -> bytes:
-    Convert audio chunk to bytes with dithering.
-    if isinstance(audio_chunk, torch.Tensor):
-        if audio_chunk.ndim > 1:
-            audio_chunk = audio_chunk.squeeze(0)
-        if audio_chunk.dtype == torch.bfloat16:
-            audio = audio_chunk.detach().cpu().to(torch.float32).numpy()
-        else:
-            audio = audio_chunk.detach().cpu().numpy()
-    else:
-        audio = audio_chunk
-    
-    # This squeeze might be redundant if the tensor is already squeezed, but it's safe to keep.
-    if audio.ndim > 1 and audio.shape[0] == 1:
-         audio = np.squeeze(audio, axis=0)
-
-    # Remove DC offset (handle both mono and multi-channel)
-    if audio.ndim > 1:
-        # For multi-channel, subtract mean from each channel independently
-        audio = audio - np.mean(audio, axis=1, keepdims=True)
-    else:
-        # For mono
-        audio = audio - np.mean(audio)
-    
-    # Clip
-    audio = np.clip(audio.astype(np.float32), -1.0, 1.0)
-    
-   
-    dither = np.random.uniform(-1, 1, size=audio.shape) * (1 / 32767.0) # More correct dithering
-    audio = audio + dither
-
-    audio = np.clip(audio, -1.0, 1.0)
-    
-    # Convert to int16
-    audio_int16 = (audio * 32767).astype(np.int16)
-    
-    return audio_int16.tobytes()
- """
-
 def audio_chunk_to_bytes(audio: np.ndarray | torch.Tensor) -> bytes:
-    """Minimal conversion - just to int16 bytes."""
+    """Minimal conversion - just to int16 bytes, with dtype fix."""
     if isinstance(audio, torch.Tensor):
-        audio = audio.detach().cpu().numpy()
+        # Detach and move to CPU
+        audio = audio.detach().cpu()
+        # Fix: Convert bf16 to f32 for NumPy compatibility
+        if audio.dtype == torch.bfloat16:
+            audio = audio.to(torch.float32)
+        # Now safe to numpy
+        audio = audio.numpy()
     
     # Ensure 1D
     audio = audio.squeeze() if audio.ndim > 1 else audio
