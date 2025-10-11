@@ -682,18 +682,22 @@ async def generate_audio_async(text: str, voice_samples: List[np.ndarray]) -> tu
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
 
+# Replace your generate_streaming_audio function in speak.py with this fixed version
+
 async def generate_streaming_audio(
     text: str, 
     voice_samples: list,
     model,
     processor,
     device,
-    stop_flag: asyncio.Event = None  # Add stop_flag param
+    stop_flag: asyncio.Event = None
 ) -> AsyncGenerator[Union[Dict[str, Any], Tuple[bytes, Dict[str, Any]]], None]:
     """
-    Zero-latency streaming with binary yields andstop support.
+    FIXED: Zero-latency streaming with proper async/thread handling.
     Yields dict for JSON control, (bytes, metadata) for binary chunks.
     """
+    generation_task = None
+    
     try:
         formatted_text = format_text_for_tts(text, len(voice_samples))
         
@@ -709,21 +713,24 @@ async def generate_streaming_audio(
             if torch.is_tensor(v):
                 inputs[k] = v.to(device, non_blocking=True)
         
-        model.set_ddpm_inference_steps(num_steps=50)
+        # FIXED: Set optimal DDPM steps for streaming
+        model.set_ddpm_inference_steps(num_steps=25)  # Balance quality/speed
         
         from vibevoice.modular.streamer import AsyncAudioStreamer
-        audio_streamer = AsyncAudioStreamer(batch_size=1)
+        audio_streamer = AsyncAudioStreamer(batch_size=1, timeout=30.0)
         
+        # Background generation function
         async def run_generation():
             def _generate():
                 try:
+                    print("Starting model generation...")
                     with torch.inference_mode():
                         if str(device) == "cuda":
                             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                                 model.generate(
                                     **inputs,
                                     max_new_tokens=None,
-                                    cfg_scale=2.0,
+                                    cfg_scale=1.5,  # Slightly lower for faster inference
                                     tokenizer=processor.tokenizer,
                                     generation_config={'do_sample': False},
                                     verbose=False,
@@ -731,25 +738,52 @@ async def generate_streaming_audio(
                                     stop_check_fn=lambda: stop_flag.is_set() if stop_flag else False,
                                 )
                         else:
-                            model.generate(**inputs, audio_streamer=audio_streamer)
+                            model.generate(
+                                **inputs,
+                                audio_streamer=audio_streamer,
+                                max_new_tokens=None,
+                                cfg_scale=1.5,
+                                tokenizer=processor.tokenizer,
+                                generation_config={'do_sample': False},
+                                verbose=False,
+                                stop_check_fn=lambda: stop_flag.is_set() if stop_flag else False,
+                            )
+                    print("Generation completed")
                 except Exception as e:
                     print(f"Generation error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    # Ensure streamer is properly closed
+                    audio_streamer.end()
             
+            # Run in thread pool to avoid blocking
             await asyncio.to_thread(_generate)
         
+        # Start generation in background
         generation_task = asyncio.create_task(run_generation())
         
-        yield {"type": "ready", "message": "Starting generation."}  # JSON control
+        # Send ready signal
+        yield {"type": "ready", "message": "Starting generation."}
         
         chunk_count = 0
+        last_chunk_time = asyncio.get_event_loop().time()
         
         try:
+            # Stream audio chunks as they become available
             async for audio_chunk in audio_streamer.get_stream(0):
+                # Check stop flag
                 if stop_flag and stop_flag.is_set():
+                    print("Stop flag detected, ending stream")
                     yield {"type": "stopped", "message": "Generation stopped."}
                     break
                 
                 chunk_count += 1
+                current_time = asyncio.get_event_loop().time()
+                chunk_interval = current_time - last_chunk_time
+                last_chunk_time = current_time
+                
+                # Convert chunk to bytes
                 audio_bytes = audio_chunk_to_bytes(audio_chunk)
                 
                 metadata = {
@@ -757,26 +791,57 @@ async def generate_streaming_audio(
                     "chunk_id": chunk_count,
                     "sample_rate": 24000,
                     "samples": len(audio_bytes) // 2,
-                    "timestamp": time.time()
+                    "timestamp": current_time,
+                    "chunk_interval_ms": chunk_interval * 1000,
                 }
-                yield (audio_bytes, metadata)  # Binary + metadata
+                
+                # Yield binary audio + metadata
+                yield (audio_bytes, metadata)
+                
+                # Small yield to prevent overwhelming the WebSocket
+                await asyncio.sleep(0.001)
             
+            print(f"Stream ended after {chunk_count} chunks")
+            
+            # Send completion signal
             yield {
                 "type": "complete",
                 "total_chunks": chunk_count,
-                "timestamp": time.time()
+                "timestamp": asyncio.get_event_loop().time()
             }
         
+        except asyncio.CancelledError:
+            print("Stream cancelled")
+            yield {"type": "stopped", "message": "Stream cancelled"}
+        
         except Exception as e:
+            print(f"Streaming error: {e}")
+            import traceback
+            traceback.print_exc()
             yield {"type": "error", "message": str(e)}
         
         finally:
-            await generation_task
+            # Ensure generation task completes
+            if generation_task and not generation_task.done():
+                print("Waiting for generation task to complete...")
+                try:
+                    await asyncio.wait_for(generation_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    print("Generation task timeout, cancelling...")
+                    generation_task.cancel()
+            
+            # Clear any remaining data
+            audio_streamer.clear()
+            
             if stop_flag:
-                stop_flag.set()  # Ensure clean exit
+                stop_flag.set()
     
     except Exception as e:
+        print(f"Fatal streaming error: {e}")
+        import traceback
+        traceback.print_exc()
         yield {"type": "error", "message": str(e)}
+
 
 def format_text_for_tts(text: str, num_speakers: int) -> str:
     """Format text with speaker labels."""
@@ -1078,19 +1143,27 @@ async def multi_speaker_tts(
 
 @app.websocket("/ws/tts-stream")
 async def websocket_tts_stream(websocket: WebSocket):
-    """WebSocket endpoint for streaming TTS."""
+    """WebSocket endpoint for streaming TTS with improved error handling."""
     await websocket.accept()
     logger.info("WebSocket connection established")
+    
+    stop_flag = None
 
     try:
         while True:
             try:
-                # Wait for job configuration
-                config_data = await websocket.receive_json()
-                logger.info(f"Received job request: {config_data}")
+                # Wait for job configuration with timeout
+                config_data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=300.0  # 5 minute timeout
+                )
+                
+                logger.info(f"Received job request: {config_data.get('type', 'unknown')}")
 
                 if config_data.get('type') == 'stop':
                     logger.info("Stop request received")
+                    if stop_flag:
+                        stop_flag.set()
                     continue
 
                 text = config_data.get('text', '')
@@ -1101,17 +1174,37 @@ async def websocket_tts_stream(websocket: WebSocket):
                 generation_type = config_data.get('type', 'single')
                 voice_files_data = config_data.get('voice_files', [])
                 
-                # Process voice samples
+                # Validate voice files
+                if not voice_files_data:
+                    await websocket.send_json({"type": "error", "message": "No voice files provided"})
+                    continue
+                
+                # Process voice samples with caching
                 cache_key = get_voice_cache_key(generation_type, voice_files_data)
                 voice_samples = get_cached_voice_samples(cache_key)
                 
                 if voice_samples is None:
+                    logger.info("Processing voice samples...")
                     voice_samples = []
                     for idx, voice_data in enumerate(voice_files_data):
-                        audio_bytes = base64.b64decode(voice_data['data'])
-                        voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
-                        voice_samples.append(voice_sample)
-                    cache_voice_samples(cache_key, voice_samples)
+                        try:
+                            audio_bytes = base64.b64decode(voice_data['data'])
+                            voice_sample = preprocess_audio(audio_bytes, f"voice_{idx}.wav")
+                            voice_samples.append(voice_sample)
+                        except Exception as e:
+                            logger.error(f"Failed to process voice {idx}: {e}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Failed to process voice sample {idx}: {str(e)}"
+                            })
+                            break
+                    
+                    if len(voice_samples) == len(voice_files_data):
+                        cache_voice_samples(cache_key, voice_samples)
+                    else:
+                        continue
+                else:
+                    logger.info("Using cached voice samples")
 
                 # Create stop flag for this job
                 stop_flag = asyncio.Event()
@@ -1125,19 +1218,45 @@ async def websocket_tts_stream(websocket: WebSocket):
                             # Binary audio chunk
                             audio_bytes, metadata = message
                             await websocket.send_bytes(audio_bytes)
+                            
                         else:
                             # JSON control message
                             await websocket.send_json(message)
                             
+                            # Break on error or stop
+                            if message.get("type") in ["error", "stopped"]:
+                                break
+                    
                     logger.info("Job completed successfully")
+                    
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected during generation")
+                    if stop_flag:
+                        stop_flag.set()
+                    break
                     
                 except Exception as e:
                     logger.error(f"Error during generation: {e}")
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": str(e)
-                    })
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": str(e)
+                        })
+                    except:
+                        pass
+                
+                finally:
+                    # Clear stop flag for next job
+                    stop_flag = None
 
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for client message")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Connection timeout"
+                })
+                break
+                
             except WebSocketDisconnect:
                 logger.info("Client disconnected")
                 break
@@ -1152,9 +1271,18 @@ async def websocket_tts_stream(websocket: WebSocket):
                 except:
                     break
                     
+    except Exception as e:
+        logger.error(f"Fatal WebSocket error: {e}")
+        
     finally:
         logger.info("Closing WebSocket connection")
-            
+        if stop_flag:
+            stop_flag.set()
+        try:
+            await websocket.close()
+        except:
+            pass
+                    
 @app.post("/reload-model")
 async def reload_model():
     """Reload the model with optimizations."""
