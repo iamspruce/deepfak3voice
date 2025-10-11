@@ -798,9 +798,6 @@ async def generate_streaming_audio(
                 # Yield binary audio + metadata
                 yield (audio_bytes, metadata)
                 
-                # Small yield to prevent overwhelming the WebSocket
-                await asyncio.sleep(0.001)
-            
             print(f"Stream ended after {chunk_count} chunks")
             
             # Send completion signal
